@@ -1,0 +1,19 @@
+paths:
+  kaggle_brahmi: "data/kaggle_brahmi"
+  raw_estampages: "data/raw_estampages"
+  processed: "data/processed"
+  synthetic: "data/synthetic"
+  models: "models"
+  outputs: "outputs"
+
+model:
+  name: "mobilenet_v2"
+  num_classes: 368          # 33 consonants + 10 vowels + 325 compounds
+  image_size: 224
+  confidence_threshold: 0.40
+
+training:
+  batch_size: 5
+  epochs: 5
+  learning_rate: 0.001
+  curriculum_start_epoch: 6   # when to start heavy synthetic noise
