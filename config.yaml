@@ -13,7 +13,7 @@ model:
   confidence_threshold: 0.40
 
 training:
-  batch_size: 5
-  epochs: 5
+  batch_size: 32           # Increase this if your GPU can handle it (e.g., 32 or 64) for faster, smoother training
+  epochs: 25               # Give it enough time to master the dataset
   learning_rate: 0.001
-  curriculum_start_epoch: 6   # when to start heavy synthetic noise
+  curriculum_start_epoch: 8 # Introduce the heavy rock damage at epoch 8

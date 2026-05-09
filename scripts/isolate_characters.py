@@ -12,6 +12,7 @@ def load_config():
     with open("config.yaml", "r") as f:
         return yaml.safe_load(f)
 
+
 def isolate_characters(image_path: str, config: dict, min_area: int = 100):
     """Extract individual characters using contour detection - robust version"""
     try:
@@ -28,7 +29,8 @@ def isolate_characters(image_path: str, config: dict, min_area: int = 100):
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         char_crops = []
-        positions = []   # for left-to-right sorting
+        positions = []  # for left-to-right sorting
+        target_size = config["model"]["image_size"]
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
@@ -38,24 +40,41 @@ def isolate_characters(image_path: str, config: dict, min_area: int = 100):
             x, y, w, h = cv2.boundingRect(cnt)
 
             # Crop character
-            char_crop = binary[y:y+h, x:x+w]
+            crop = binary[y:y + h, x:x + w]
 
-            # Resize to model input size
-            target_size = config["model"]["image_size"]
-            char_crop = cv2.resize(char_crop, (target_size, target_size))
+            if crop.size == 0:
+                continue
 
-            char_crops.append(char_crop)
-            positions.append(x)   # x-position for sorting
+            # Calculate difference between height and width
+            diff = abs(h - w)
+            pad_top, pad_bottom, pad_left, pad_right = 0, 0, 0, 0
 
-        # Sort left to right
+            if h > w:  # Taller than it is wide
+                pad_left = diff // 2
+                pad_right = diff - pad_left
+            elif w > h:  # Wider than it is tall
+                pad_top = diff // 2
+                pad_bottom = diff - pad_top
+
+            # Pad with black (0) to maintain the background geometry
+            square_crop = cv2.copyMakeBorder(crop, pad_top, pad_bottom, pad_left, pad_right,
+                                             cv2.BORDER_CONSTANT, value=0)
+
+            # Safely resize the perfect square
+            final_crop = cv2.resize(square_crop, (target_size, target_size))
+
+            char_crops.append(final_crop)
+            positions.append(x)  # x-position for sorting
+
+        # THE FIX FROM EARLIER: Safely sort left to right avoiding array truth ambiguity
         if positions:
-            sorted_chars = [crop for _, crop in sorted(zip(positions, char_crops))]
+            sorted_chars = [crop for _, crop in sorted(zip(positions, char_crops), key=lambda item: item[0])]
             return sorted_chars
         else:
             return []
 
     except Exception as e:
-        print(f"❌ Error processing {Path(image_path).name}: {e}")
+        print(f"  Error processing {Path(image_path).name}: {e}")
         return []
 
 def main():
