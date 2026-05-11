@@ -37,6 +37,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks
+from skimage.metrics import structural_similarity as _ssim
 import os
 from pathlib import Path
 
@@ -45,25 +46,61 @@ from pathlib import Path
 # 1.  PREPROCESSING
 # ======================================================================
 
-def preprocess(raw_bgr):
+def preprocess(raw_bgr,
+               nlm_h: int         = 10,
+               bilateral: bool    = True,
+               otsu_bias: int     = 20,
+               dilate_kernel: tuple = (3, 3),
+               dilate_iters: int  = 1):
     """
+    Preprocessing pipeline.
+
+    Parameters (all tunable per image)
+    ------------------------------------
+    nlm_h          : Non-Local Means filter strength. Higher = more smoothing
+                     but risks erasing thin strokes. Default 10 (gentle).
+                     Reference paper uses h=30 — heavier, but they also add
+                     bilateral filtering afterwards to recover edges.
+    bilateral      : If True, apply Bilateral Filter after NLMeans (as the
+                     reference paper does). Bilateral preserves character edges
+                     while smoothing flat regions. d=9, sigmaColor=sigmaSpace=75.
+    otsu_bias      : Subtracted from Otsu's global threshold before binarising.
+                     Higher bias → more aggressive (dark ink) capture.
+                     Default 20 (from paper). Lower for faded inscriptions.
+    dilate_kernel  : (w, h) of structuring element for the stroke-gap-closing
+                     morphological closing step (reference paper: configurable).
+                     Default (3,3) ellipse. Increase for heavily fragmented strokes.
+    dilate_iters   : Iterations for the morphological closing. Default 1.
+
     Returns
     -------
-    gray          : original grayscale
-    binary_clean  : WHITE text on BLACK -- used for ALL character work
-    dilated_crop  : aggressively dilated -- used ONLY to find crop bbox
+    gray, binary_clean, dilated_crop, metrics
+
+    metrics dict contains PSNR, SSIM, Laplacian variance, and edge retention
+    ratio — the four quality indicators reported by the reference paper.
     """
     gray = (cv2.cvtColor(raw_bgr, cv2.COLOR_BGR2GRAY)
             if raw_bgr.ndim == 3 else raw_bgr.copy())
 
-    den = cv2.fastNlMeansDenoising(gray, None, h=10,
+    # ── Step 1: Non-Local Means denoising ────────────────────────────────
+    den = cv2.fastNlMeansDenoising(gray, None, h=nlm_h,
                                    templateWindowSize=7, searchWindowSize=21)
 
+    # ── Step 2 (NEW): Bilateral filter — edge-preserving second pass ─────
+    # The reference paper applies this after NLMeans to further smooth noise
+    # in flat background regions without blurring character stroke boundaries.
+    # Key advantage for Brahmi: the bilateral kernel's range-σ (75) keeps sharp
+    # ink edges intact while the spatial-σ (75) smooths surface texture noise.
+    if bilateral:
+        den = cv2.bilateralFilter(den, d=9, sigmaColor=75, sigmaSpace=75)
+
+    # ── Step 3: Adjusted Otsu binarisation ───────────────────────────────
     t_glob, _ = cv2.threshold(den, 0, 255,
                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    t_adj = max(0, t_glob - 20)
+    t_adj = max(0, t_glob - otsu_bias)
     _, binary = cv2.threshold(den, t_adj, 255, cv2.THRESH_BINARY)
-    print(f"  Otsu T_global={t_glob:.0f}  T_adjusted={t_adj:.0f}")
+    print(f"  Otsu T_global={t_glob:.0f}  T_adjusted={t_adj:.0f}  "
+          f"(bilateral={'on' if bilateral else 'off'}  nlm_h={nlm_h})")
 
     # Auto-polarity: ensure WHITE = foreground text
     if np.mean(binary == 255) > 0.55:
@@ -72,17 +109,44 @@ def preprocess(raw_bgr):
     else:
         print("  Polarity: kept (background already black)")
 
-    # Gentle 3x3 closing: repairs tiny stroke gaps without bloat
-    se3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    binary_clean = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, se3, iterations=1)
+    # ── Step 4: Morphological closing — configurable kernel/iterations ───
+    # Reference paper: user-tunable kernel size and iteration count so
+    # researchers can adapt to varying inscription quality / DPI.
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, dilate_kernel)
+    binary_clean = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, se,
+                                    iterations=dilate_iters)
 
-    # Large dilation for crop-region detection ONLY
+    # Large dilation for crop-region detection ONLY (unchanged)
     se_h = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 1))
     se_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 11))
     dilated_crop = cv2.dilate(binary_clean, se_h, iterations=1)
     dilated_crop = cv2.dilate(dilated_crop, se_v, iterations=1)
 
-    return gray, binary_clean, dilated_crop
+    # ── Quality metrics (reference paper Section 7.1.1) ──────────────────
+    # Computed once here so run_module1 can log and save them.
+    mse = np.mean((gray.astype(float) - den.astype(float)) ** 2)
+    psnr = float(10 * np.log10(255 ** 2 / mse)) if mse > 0 else 99.0
+
+    ssim_val, _ = _ssim(gray, den, full=True)
+
+    lap_var = float(cv2.Laplacian(binary_clean, cv2.CV_64F).var())
+
+    edges_orig = cv2.Canny(gray, 50, 150)
+    edges_proc = cv2.Canny(den,  50, 150)
+    n_orig = int(np.sum(edges_orig > 0))
+    edge_retention = (float(np.sum(edges_proc > 0)) / n_orig
+                      if n_orig > 0 else 1.0)
+
+    metrics = {
+        "psnr":            round(psnr,  2),
+        "ssim":            round(float(ssim_val), 4),
+        "laplacian_var":   round(lap_var, 1),
+        "edge_retention":  round(edge_retention, 3),
+    }
+    print(f"  Quality metrics: PSNR={psnr:.1f}dB  SSIM={ssim_val:.3f}  "
+          f"Laplacian={lap_var:.0f}  EdgeRetention={edge_retention*100:.1f}%")
+
+    return gray, binary_clean, dilated_crop, metrics
 
 
 # ======================================================================
@@ -91,20 +155,63 @@ def preprocess(raw_bgr):
 
 def crop_to_inscription(dilated_crop, binary_clean, pad=8):
     """
-    Locate largest white blob in dilated_crop -> bounding box.
-    Crop that region from binary_clean (NOT from dilated).
+    Find the inscription bounding box from the dilated binary and crop
+    the clean binary to that region.
+
+    ROOT CAUSE FIX (union-bbox):
+    ─────────────────────────────
+    The old code picked only the SINGLE LARGEST connected component.
+    This fails when the inscription contains multiple character groups
+    with dark stone texture between them — the right group may be larger
+    than the left group (more pixels due to noise accumulation), so the
+    left characters are silently dropped.
+
+    Fix: use the UNION bounding box of ALL significant blobs.
+    A blob is 'significant' if its area ≥ min_area_ratio of the image area.
+    This guarantees every character cluster is included regardless of which
+    individual blob happens to be the largest.
+
+    min_area_ratio is set to 0.5% of image area — large enough to ignore
+    isolated dust specks but small enough to catch small character groups.
     """
-    nl, _, st, _ = cv2.connectedComponentsWithStats(dilated_crop, connectivity=8)
-    if nl < 2:
-        return binary_clean.copy(), (0, 0, binary_clean.shape[1], binary_clean.shape[0])
-
-    lbl = 1 + np.argmax(st[1:, cv2.CC_STAT_AREA])
-    x, y = st[lbl, cv2.CC_STAT_LEFT], st[lbl, cv2.CC_STAT_TOP]
-    w, h = st[lbl, cv2.CC_STAT_WIDTH], st[lbl, cv2.CC_STAT_HEIGHT]
-
     H, W = binary_clean.shape[:2]
-    x0, y0 = max(0, x - pad), max(0, y - pad)
-    x1, y1 = min(W, x + w + pad), min(H, y + h + pad)
+    nl, _, st, _ = cv2.connectedComponentsWithStats(dilated_crop, connectivity=8)
+
+    if nl < 2:
+        return binary_clean.copy(), (0, 0, W, H)
+
+    img_area     = H * W
+    min_blob_area = max(50, img_area * 0.005)   # 0.5% of image area
+
+    # Collect all significant blobs
+    sig_blobs = [
+        (int(st[i, cv2.CC_STAT_LEFT]),
+         int(st[i, cv2.CC_STAT_TOP]),
+         int(st[i, cv2.CC_STAT_WIDTH]),
+         int(st[i, cv2.CC_STAT_HEIGHT]))
+        for i in range(1, nl)
+        if st[i, cv2.CC_STAT_AREA] >= min_blob_area
+    ]
+
+    if not sig_blobs:
+        # Fallback: use entire image
+        return binary_clean.copy(), (0, 0, W, H)
+
+    # Union bounding box
+    x_min = min(b[0] for b in sig_blobs)
+    y_min = min(b[1] for b in sig_blobs)
+    x_max = max(b[0] + b[2] for b in sig_blobs)
+    y_max = max(b[1] + b[3] for b in sig_blobs)
+
+    x0 = max(0, x_min - pad)
+    y0 = max(0, y_min - pad)
+    x1 = min(W, x_max + pad)
+    y1 = min(H, y_max + pad)
+
+    n_blobs = len(sig_blobs)
+    print(f"  Crop: {n_blobs} significant blob(s) → "
+          f"union bbox x={x0}-{x1}  y={y0}-{y1}")
+
     return binary_clean[y0:y1, x0:x1].copy(), (x0, y0, x1, y1)
 
 
@@ -123,9 +230,42 @@ def _cca_filter(img, threshold, kill_color, replace_color):
 
 
 def noise_removal(cropped, white_thresh=200, black_thresh=200):
+    """
+    Two-pass CCA noise removal.  Input/output: WHITE text on BLACK background.
+
+    Pass 1 (on white-on-black directly):
+        Find small WHITE clusters (< white_thresh px²).
+        These are small foreground noise specks and micro char fragments.
+        Convert them to BLACK → closes minor gaps, cleans speckle noise.
+
+    Invert → now BLACK chars on WHITE background.
+
+    Pass 2 (on the inverted black-on-white image):
+        Find small BLACK clusters (< black_thresh px²).
+        In the inverted image, BLACK = characters.
+        Small black clusters = isolated char fragment noise.
+        Convert them to WHITE → erases tiny isolated char noise specks.
+
+        BUG NOTE fixed here: Pass 2 must use kill_color=0 (kill BLACK),
+        NOT kill_color=255 (which would kill white background fragments —
+        the opposite of what is needed).  The reference paper Ch.5 states:
+        "black pixel clusters now representing residual noise or artifacts
+        after inversion. Small black clusters are converted to white."
+
+    Re-invert → WHITE chars on BLACK, clean.
+    """
+    # Pass 1: remove small WHITE (foreground noise) from white-on-black
     p1  = _cca_filter(cropped, white_thresh, kill_color=255, replace_color=0)
+
+    # Invert to black-on-white for pass 2
     inv = cv2.bitwise_not(p1)
-    p2  = _cca_filter(inv,    black_thresh, kill_color=255, replace_color=0)
+
+    # Pass 2: remove small BLACK (char fragment noise) from black-on-white
+    #         kill_color=0  → mask = bitwise_not(inv) = highlights black regions
+    #         replace_color=255 → erase found black clusters to white
+    p2  = _cca_filter(inv, black_thresh, kill_color=0, replace_color=255)
+
+    # Re-invert to restore white-on-black
     return p1, inv, cv2.bitwise_not(p2)
 
 
@@ -624,6 +764,103 @@ def place_boundaries(proj_s, n_chars, image_W, binary_img):
 
 
 # ======================================================================
+# 7b.  BOUNDARY QUALITY FILTER  (remove cuts inside characters)
+# ======================================================================
+
+def filter_weak_boundaries(boundaries, proj_s, gap_floor_ratio=0.45):
+    """
+    Remove interior boundary positions where the projection profile does NOT
+    show a genuine inter-character gap.
+
+    Root cause this fixes
+    ---------------------
+    place_boundaries selects cuts from valley positions in the projection.
+    But when count_characters over-estimates (e.g. returns 10 for 8 chars),
+    some of the extra cuts land INSIDE characters because:
+      • Characters with internal structure (hollow box, L-shape) have
+        projection dips inside them.
+      • The estimator mistake these dips for inter-character gaps.
+
+    The fix: for each proposed cut at column x, check whether the projection
+    NEAR x is actually low enough to constitute a real gap.  Two criteria
+    must BOTH be true:
+
+    1. LOCAL criterion  : proj near x < 55% of the LOCAL max of the two
+                          adjacent segments.  Chars with internal dips still
+                          have high proj on both sides; genuine gaps do not.
+
+    2. GLOBAL criterion : proj near x ≤ gap_floor_ratio × global_max.
+                          Intra-char dips stay above this floor; real gaps
+                          typically fall below it.
+
+    If either criterion fails → the cut is inside a character → REMOVE IT.
+    The two adjacent segments will remain merged as one character.
+
+    Parameters
+    ----------
+    boundaries      : list of x-positions [t0, cut1, cut2, ..., t1]
+    proj_s          : smoothed vertical projection profile array
+    gap_floor_ratio : same threshold used by other stages (default 0.45)
+
+    Returns
+    -------
+    Filtered boundary list (shorter if weak cuts removed).
+    """
+    if len(boundaries) <= 2:
+        return boundaries
+
+    global_floor = proj_s.max() * gap_floor_ratio
+    # Narrow window: only look very close to the cut column
+    # Wide windows risk "borrowing" depth from a nearby genuine gap
+    win = max(2, int(len(proj_s) * 0.008))   # ~0.8% of image width
+
+    valid = [boundaries[0]]
+    for i in range(1, len(boundaries) - 1):
+        b        = int(boundaries[i])
+        left_b   = int(boundaries[i - 1])
+        right_b  = int(boundaries[i + 1])
+
+        # Local max = max projection in the two adjacent segments
+        left_proj  = proj_s[left_b:b]
+        right_proj = proj_s[b:right_b]
+        local_max  = max(
+            float(left_proj.max())  if len(left_proj)  > 0 else 0,
+            float(right_proj.max()) if len(right_proj) > 0 else 0
+        )
+
+        # Min projection in a tight window around the cut
+        lo = max(0, b - win)
+        hi = min(len(proj_s), b + win + 1)
+        min_near = float(proj_s[lo:hi].min())
+
+        local_ok  = (local_max == 0) or (min_near < local_max * 0.55)
+        global_ok = min_near <= global_floor
+
+        if local_ok and global_ok:
+            valid.append(b)
+        else:
+            reasons = []
+            if not local_ok:
+                reasons.append(
+                    f"local {min_near:.0f}/{local_max:.0f} = "
+                    f"{min_near/local_max*100:.0f}% >= 55%"
+                )
+            if not global_ok:
+                reasons.append(
+                    f"global {min_near:.0f} > floor {global_floor:.0f}"
+                )
+            print(f"    Cut REMOVED (inside char) at x={b}: "
+                  f"{' | '.join(reasons)}")
+
+    valid.append(boundaries[-1])
+    removed = len(boundaries) - len(valid)
+    if removed:
+        print(f"    {removed} weak cut(s) removed → "
+              f"{len(valid)-1} genuine cuts remain")
+    return valid
+
+
+# ======================================================================
 # 8.  SEGMENT VALIDATION + MZS SPLIT
 # ======================================================================
 
@@ -685,6 +922,47 @@ def validate_and_split(boundaries, proj_s, image_W, binary_img,
 
     segs = merge_overlaps(sorted(segs))
 
+    def has_genuine_gap_inside(x0, x1):
+        """
+        Return True only if there is evidence of a genuine inter-character gap
+        INSIDE segment [x0, x1].
+
+        Two tests must BOTH pass:
+
+        Test 1 – LOCAL dip:  the projection must dip to below 55% of the
+          segment's OWN local maximum somewhere inside.  A wide single character
+          has relatively uniform projection; two joined characters have a visible
+          dip between them relative to their own peaks.
+
+        Test 2 – ABSOLUTE floor:  the dip must also be below the global gap
+          floor (GAP_FLOOR_RATIO * global_max).  This prevents splitting on
+          a shallow dip that is still clearly within a character body.
+
+        Using local max (not global) is critical: a wide character that is
+        shorter than the tallest character in the image will have projection
+        values that look low relative to the global max even though it is
+        a single character with no internal gap.
+        """
+        sub = proj_s[x0:x1]
+        if len(sub) < 4:
+            return False
+
+        local_max    = float(sub.max())
+        local_min    = float(sub.min())
+        global_floor = proj_s.max() * globals().get("GAP_FLOOR_RATIO", 0.45)
+
+        # Test 1: dip below 55% of segment's own peak
+        local_dip_ok = local_min < local_max * 0.55
+        # Test 2: dip also below the global gap floor
+        global_floor_ok = local_min <= global_floor
+
+        ok = local_dip_ok and global_floor_ok
+        print(f"      gap_check x={x0}-{x1}: local_min={local_min:.0f} "
+              f"local_max={local_max:.0f} ({local_min/local_max*100:.0f}%) "
+              f"global_floor={global_floor:.0f}  "
+              f"split={'YES' if ok else 'NO (wide single char)'}")
+        return ok
+
     # ── MZS split ────────────────────────────────────────────────────────
     changed = True
     passes  = 0
@@ -702,6 +980,14 @@ def validate_and_split(boundaries, proj_s, image_W, binary_img,
         new_segs    = []
         for (x0, x1), z in zip(segs, mzs):
             if z > mzs_thresh:
+                if not has_genuine_gap_inside(x0, x1):
+                    # Wide but no internal gap → genuine wide single character
+                    print(f"    MZS skip (no gap inside): x={x0} w={x1-x0} "
+                          f"z={z:.2f}  min_proj="
+                          f"{proj_s[x0:x1].min():.0f} > floor="
+                          f"{proj_s.max()*globals().get('GAP_FLOOR_RATIO',0.45):.0f}")
+                    new_segs.append((x0, x1))
+                    continue
                 mid = best_split(x0, x1)
                 if mid - x0 >= min_w and x1 - mid >= min_w:
                     new_segs.extend([(x0, mid), (mid, x1)])
@@ -716,24 +1002,56 @@ def validate_and_split(boundaries, proj_s, image_W, binary_img,
             if c is not None]
 
 
+def _boundary_has_char_pixels(c, nxt, binary_img, min_density=0.08):
+    """
+    Inspect the actual binary image pixels at the cut column between c and nxt.
+
+    Returns True  → cut column contains character pixels = wrong cut → MERGE
+    Returns False → cut column is empty = genuine inter-character gap → KEEP SEPARATE
+
+    This is the ground-truth check that projection profiles cannot provide
+    for sparse inscriptions where projection dips inside characters.
+    """
+    H   = binary_img.shape[0]
+    bx  = c["x"] + c["w"]
+    win = max(1, int(binary_img.shape[1] * 0.005))   # ≈ 0.5% of width
+    x0  = max(0, bx - win)
+    x1  = min(binary_img.shape[1], bx + win + 1)
+    region  = binary_img[:, x0:x1]
+    density = np.sum(region == 255) / (H * max(1, x1 - x0))
+    return density > min_density
+
+
 def post_merge_narrow_segments(clusters, binary_img, proj_s,
                                min_width_ratio=0.55):
     """
-    After splitting, merge any adjacent pair where BOTH segments are
-    narrower than min_width_ratio * median_width.
+    Merge adjacent segments only when two conditions are BOTH true:
 
-    This is the critical over-split repair step.  When a projection valley
-    is detected inside a character (hollow shape, thin bridge of noise),
-    the two halves will both be narrower than a normal character.
-    Merging them restores the correct boundary.
+    Condition 1 – Width (sliver check):
+      At least one of the two segments is narrower than
+      min_width_ratio × original_median_width.
+      Three sub-cases: both narrow / left sliver / right sliver.
 
-    Also merges a very narrow segment (< 40% of median) unconditionally
-    with its smaller neighbour — these are almost always fragment slivers
-    from the edge of a character, not real characters.
+    Condition 2 – Boundary pixel gate (THE KEY FIX):
+      The actual binary image at the cut column between the two segments
+      must contain significant character pixels (density > 8% of col height).
 
-    Parameters
-    ----------
-    min_width_ratio : adjacent pair merged if BOTH < this * median_w
+      WHY: If the cut column is EMPTY → it is a genuine inter-character gap.
+           Do NOT merge even if one segment looks narrow (it IS a small char).
+           If the cut column has PIXELS → the cut went through a character.
+           MERGE the two halves back into one character.
+
+      This binary-image check is the ground truth that projection-profile
+      analysis cannot provide for sparse inscriptions:
+        • Projection dips inside characters → projection says "merge"
+        • But the binary pixels at the gap column = 0 → binary says "keep"
+        • Binary always wins.
+
+    Exception: extreme slivers (< 30% of median) are merged regardless,
+    because no complete Brahmi character can be that narrow.
+
+    Stable median: computed once from original widths; never recomputed,
+    preventing threshold creep across passes.
     """
     if len(clusters) < 2:
         return clusters
@@ -750,52 +1068,82 @@ def post_merge_narrow_segments(clusters, binary_img, proj_s,
                 "w": x1 - x0, "h": int(rows[-1]) - int(rows[0]),
                 "area": int(np.sum(strip == 255))}
 
+    base_median_w = float(np.median([c["w"] for c in clusters]))
+    min_w         = min_width_ratio * base_median_w
+    extreme_w     = 0.30 * base_median_w
+
     changed = True
     passes  = 0
-    while changed and passes < 5:
+    while changed and passes < 6:
         changed = False
         passes += 1
-
-        widths   = [c["w"] for c in clusters]
-        median_w = float(np.median(widths))
-        min_pair = min_width_ratio * median_w    # both must be below this
-        min_solo = 0.40 * median_w               # unconditional merge threshold
 
         new_clusters = []
         i = 0
         while i < len(clusters):
             c = clusters[i]
+
+            # ── Tail segment ─────────────────────────────────────────
             if i == len(clusters) - 1:
-                new_clusters.append(c)
+                if new_clusters and c["w"] < min_w:
+                    prev    = new_clusters[-1]
+                    extreme = c["w"] < extreme_w
+                    has_px  = _boundary_has_char_pixels(prev, c, binary_img)
+                    if extreme or has_px:
+                        x0 = prev["x"];  x1 = c["x"] + c["w"]
+                        merged = make_cluster(x0, x1, len(new_clusters) - 1)
+                        if merged:
+                            new_clusters[-1] = merged
+                            changed = True
+                            gate = "extreme" if extreme else "wrong-cut pixels"
+                            print(f"    Post-merge tail ({gate}): "
+                                  f"w={prev['w']}+{c['w']}->{x1-x0}")
+                        else:
+                            new_clusters.append(c)
+                    else:
+                        print(f"    Post-merge SKIPPED (tail, genuine gap): "
+                              f"w={prev['w']}+{c['w']}  boundary is empty")
+                        new_clusters.append(c)
+                else:
+                    new_clusters.append(c)
                 i += 1
                 continue
 
             nxt = clusters[i + 1]
-            w_c = c["w"]
-            w_n = nxt["w"]
+            w_c = c["w"];  w_n = nxt["w"]
 
-            # Case 1: BOTH neighbours are too narrow → merge
-            both_narrow = (w_c < min_pair) and (w_n < min_pair)
-            # Case 2: current segment is a sliver (< 40% median) → merge with next
-            solo_sliver = (w_c < min_solo)
+            both_narrow  = (w_c < min_w) and (w_n < min_w)
+            left_sliver  = (w_c < min_w)
+            right_sliver = (w_n < min_w)
 
-            if both_narrow or solo_sliver:
-                x0 = c["x"]
-                x1 = nxt["x"] + nxt["w"]
-                merged = make_cluster(x0, x1, len(new_clusters))
-                if merged:
-                    new_clusters.append(merged)
-                    i += 2
-                    changed = True
-                    print(f"    Post-merge: x={x0} w_left={w_c} w_right={w_n} "
-                          f"-> merged w={x1-x0}  "
-                          f"({'both narrow' if both_narrow else 'sliver'})")
-                    continue
+            if both_narrow or left_sliver or right_sliver:
+                extreme = (w_c < extreme_w) or (w_n < extreme_w)
+                has_px  = _boundary_has_char_pixels(c, nxt, binary_img)
+
+                if extreme or has_px:
+                    x0 = c["x"];  x1 = nxt["x"] + nxt["w"]
+                    merged = make_cluster(x0, x1, len(new_clusters))
+                    if merged:
+                        new_clusters.append(merged)
+                        i += 2
+                        changed = True
+                        reason = ("both narrow" if both_narrow else
+                                  "left sliver"  if left_sliver  else
+                                  "right sliver")
+                        gate   = "extreme" if extreme else "wrong-cut pixels"
+                        print(f"    Post-merge ({reason}, {gate}): "
+                              f"w={w_c}+{w_n}->{x1-x0}  "
+                              f"(median={base_median_w:.0f}  "
+                              f"thresh={min_w:.1f})")
+                        continue
+                else:
+                    print(f"    Post-merge SKIPPED (genuine gap): "
+                          f"w={w_c}+{w_n}  "
+                          f"boundary col is empty → two separate chars")
 
             new_clusters.append(c)
             i += 1
 
-        # Re-label
         for idx, c in enumerate(new_clusters):
             c["label"] = idx + 1
         clusters = new_clusters
@@ -963,34 +1311,209 @@ def vis_pipeline(stages, out_path):
     print(f"  Pipeline summary -> {out_path}")
 
 
+def auto_calibrate(image_path: str) -> dict:
+    """
+    Automatically measure image characteristics and return the optimal
+    processing parameters for that specific image.
+
+    This is the standardisation solution: instead of every image needing
+    manual parameter tuning, this function analyses the image and sets
+    parameters adaptively so all images get accurate output.
+
+    Measurements
+    ─────────────
+    noise_ratio   : mean(|Laplacian|) / dynamic_range
+                    Measures texture noise relative to the image's contrast.
+                    Low  (< 0.05) = clean, high-contrast scan.
+                    High (> 0.15) = very noisy, degraded stone texture.
+
+    contrast      : 95th percentile - 5th percentile of pixel values.
+                    High contrast = clear ink vs background separation.
+                    Low contrast  = faded/worn inscription.
+
+    fg_ratio      : fraction of pixels above Otsu threshold (foreground %).
+                    Very low (< 0.10) = sparse text, few connected chars.
+                    High     (> 0.40) = dense/merged text blobs.
+
+    blob_ratio    : area of largest CCA blob / total image area.
+                    High blob_ratio = characters are joined through noise.
+
+    Parameter mapping
+    ─────────────────
+    nlm_h          → stronger for noisier images (noise_ratio)
+    bilateral      → always True (improves edge preservation)
+    otsu_bias      → higher for low-contrast images
+    white_thresh   → lower for images with fine noise speckles
+    black_thresh   → lower for sparse images (preserve thin strokes)
+    gap_floor      → lower for noisy/joined text; higher for clean text
+    """
+    raw  = cv2.imread(image_path)
+    if raw is None:
+        raise FileNotFoundError(f"Cannot read: {image_path}")
+    gray = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY) if raw.ndim == 3 else raw
+
+    H, W = gray.shape[:2]
+
+    # ── Noise measurement ────────────────────────────────────────────────
+    lap         = cv2.Laplacian(gray.astype(float), cv2.CV_64F)
+    dyn_range   = max(1.0, float(gray.max()) - float(gray.min()))
+    noise_ratio = float(np.abs(lap).mean()) / dyn_range
+
+    # ── Contrast ─────────────────────────────────────────────────────────
+    contrast    = float(np.percentile(gray, 95) - np.percentile(gray, 5))
+
+    # ── Foreground density (quick Otsu) ──────────────────────────────────
+    _, bw      = cv2.threshold(gray, 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    fg_ratio   = float(np.mean(bw == 255))
+    if fg_ratio > 0.55:
+        fg_ratio = 1.0 - fg_ratio   # image was inverted; report minority
+
+    # ── Blob connectivity (with light denoising) ─────────────────────────
+    den_quick  = cv2.fastNlMeansDenoising(gray, None, h=15,
+                                          templateWindowSize=7,
+                                          searchWindowSize=21)
+    _, bw2     = cv2.threshold(den_quick, 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(bw2 == 255) > 0.55:
+        bw2 = cv2.bitwise_not(bw2)
+    n2, _, st2, _ = cv2.connectedComponentsWithStats(bw2, connectivity=8)
+    areas2     = [int(st2[i, cv2.CC_STAT_AREA]) for i in range(1, n2)]
+    blob_ratio = float(max(areas2)) / (H * W) if areas2 else 0.0
+
+    print(f"  Auto-calibrate:  noise_ratio={noise_ratio:.4f}  "
+          f"contrast={contrast:.0f}  fg_ratio={fg_ratio:.3f}  "
+          f"blob_ratio={blob_ratio:.4f}")
+
+    # ── Parameter mapping ────────────────────────────────────────────────
+
+    # nlm_h: 5 (clean) → 30 (very noisy)
+    if noise_ratio < 0.05:
+        nlm_h = 5
+    elif noise_ratio < 0.08:
+        nlm_h = 10
+    elif noise_ratio < 0.12:
+        nlm_h = 18
+    elif noise_ratio < 0.18:
+        nlm_h = 25
+    else:
+        nlm_h = 30
+
+    # otsu_bias: 20 normal; 30 for low contrast (capture more ink)
+    otsu_bias = 30 if contrast < 150 else 20
+
+    # white_thresh / black_thresh:
+    # Noisy images have many tiny speckles → lower threshold to kill more
+    # Clean images have fewer, larger blobs → higher threshold to be safe
+    if noise_ratio < 0.06:
+        noise_thresh = 50
+    elif noise_ratio < 0.10:
+        noise_thresh = 100
+    elif noise_ratio < 0.15:
+        noise_thresh = 150
+    else:
+        noise_thresh = 200
+
+    # gap_floor:
+    # Noisy / heavily joined images → lower floor (accept shallow valleys)
+    # Clean images with real gaps    → higher floor (reject intra-char dips)
+    if blob_ratio > 0.15:
+        gap_floor = 0.30          # severely connected
+    elif blob_ratio > 0.08:
+        gap_floor = 0.35          # moderately connected
+    elif noise_ratio > 0.12:
+        gap_floor = 0.40          # noisy but separable
+    elif noise_ratio > 0.06:
+        gap_floor = 0.45          # normal
+    else:
+        gap_floor = 0.55          # clean, well-separated characters
+
+    params = {
+        "nlm_h":              nlm_h,
+        "bilateral":          True,
+        "otsu_bias":          otsu_bias,
+        "dilate_kernel":      (3, 3),
+        "dilate_iters":       1,
+        "white_noise_thresh": noise_thresh,
+        "black_noise_thresh": noise_thresh,
+        "gap_floor_ratio":    gap_floor,
+        "mzs_threshold":      3.0,
+        # diagnostics (not passed to run_module1)
+        "_noise_ratio":       round(noise_ratio, 4),
+        "_contrast":          round(contrast, 1),
+        "_fg_ratio":          round(fg_ratio, 3),
+        "_blob_ratio":        round(blob_ratio, 4),
+    }
+
+    print(f"  → nlm_h={nlm_h}  noise_thresh={noise_thresh}  "
+          f"gap_floor={gap_floor}  otsu_bias={otsu_bias}")
+    return params
+
+
 # ======================================================================
 # MAIN PIPELINE
 # ======================================================================
 
 def run_module1(image_path: str,
                 out_dir: str             = "output_module1",
-                white_noise_thresh: int  = 200,
-                black_noise_thresh: int  = 200,
+                white_noise_thresh: int  = None,
+                black_noise_thresh: int  = None,
                 mzs_threshold: float     = 3.0,
-                gap_floor_ratio: float   = 0.45,
+                gap_floor_ratio: float   = None,
+                nlm_h: int               = None,
+                bilateral: bool          = True,
+                otsu_bias: int           = None,
+                dilate_kernel: tuple     = (3, 3),
+                dilate_iters: int        = 1,
+                auto_params: bool        = True,
                 save_individual_chars: bool = True,
                 show_plots: bool         = False) -> dict:
     """
     Full Module 1 pipeline.
 
-    Key parameters
-    --------------
-    gap_floor_ratio : Controls how deep a valley must be to count as a real
-                      inter-character gap.  Range 0.0-1.0, default 0.45.
-                      0.45 = valley must drop to <= 45% of peak projection.
-                      RAISE for cleaner images (clearer gaps).  0.55-0.65.
-                      LOWER for dense/damaged inscriptions.  0.30-0.40.
-    mzs_threshold   : Modified Z-Score threshold for splitting wide segments.
-                      Lower = more splits.  Default 3.0.
+    auto_params : bool (default True)
+        When True, auto_calibrate() measures the image and sets all
+        processing parameters automatically.  Any parameter you pass
+        explicitly OVERRIDES the auto-detected value.  Set to False
+        only if you want full manual control of all parameters.
+
+    Preprocessing controls (override auto_params when specified)
+    ────────────────────────────────────────────────────────────
+    nlm_h          : Non-Local Means filter strength.
+    bilateral      : Bilateral edge-preserving filter after NLMeans.
+    otsu_bias      : Subtracted from Otsu threshold before binarising.
+    dilate_kernel  : Morphological closing kernel (w, h).
+    dilate_iters   : Closing iterations.
+
+    Segmentation controls
+    ─────────────────────
+    gap_floor_ratio : Valley depth threshold.
+                      RAISE if too many chars, LOWER if too few.
+    mzs_threshold   : Modified Z-Score split threshold.
     """
-    # Apply gap_floor_ratio to the module-level constant used by estimators
-    import darken2 as _self
-    _self.GAP_FLOOR_RATIO = gap_floor_ratio
+    import sys as _sys
+
+    # ── Auto-calibrate first, then apply any explicit overrides ──────────
+    if auto_params:
+        print(f"\n[AUTO] Calibrating parameters for: {image_path}")
+        cal = auto_calibrate(image_path)
+        # Use calibrated value unless caller passed an explicit override
+        _nlm_h        = nlm_h              if nlm_h              is not None else cal["nlm_h"]
+        _bilateral    = bilateral
+        _otsu_bias    = otsu_bias          if otsu_bias           is not None else cal["otsu_bias"]
+        _white_thresh = white_noise_thresh if white_noise_thresh  is not None else cal["white_noise_thresh"]
+        _black_thresh = black_noise_thresh if black_noise_thresh  is not None else cal["black_noise_thresh"]
+        _gap_floor    = gap_floor_ratio    if gap_floor_ratio     is not None else cal["gap_floor_ratio"]
+    else:
+        # Full manual mode — use defaults if not specified
+        _nlm_h        = nlm_h              if nlm_h              is not None else 10
+        _bilateral    = bilateral
+        _otsu_bias    = otsu_bias          if otsu_bias           is not None else 20
+        _white_thresh = white_noise_thresh if white_noise_thresh  is not None else 200
+        _black_thresh = black_noise_thresh if black_noise_thresh  is not None else 200
+        _gap_floor    = gap_floor_ratio    if gap_floor_ratio     is not None else 0.45
+
+    _sys.modules[__name__].GAP_FLOOR_RATIO = _gap_floor
     os.makedirs(out_dir, exist_ok=True)
     chars_dir = os.path.join(out_dir, "characters")
     os.makedirs(chars_dir, exist_ok=True)
@@ -1000,6 +1523,10 @@ def run_module1(image_path: str,
     print(f"  Module 1  Brahmi Inscription Segmentation")
     print(f"  Input  : {image_path}")
     print(f"  Output : {out_dir}")
+    print(f"  Params : nlm_h={_nlm_h}  bilateral={_bilateral}  "
+          f"otsu_bias={_otsu_bias}")
+    print(f"           noise_thresh={_white_thresh}/{_black_thresh}  "
+          f"gap_floor={_gap_floor}  auto={'yes' if auto_params else 'no'}")
     print(sep)
 
     # Load
@@ -1009,12 +1536,44 @@ def run_module1(image_path: str,
     print(f"\n[0] Loaded  shape={raw.shape}")
     cv2.imwrite(os.path.join(out_dir, "00_raw.png"), raw)
 
-    # Step 1
+    # Step 1 — Preprocessing (now with quality metrics)
     print("\n[1] Preprocessing ...")
-    gray, binary_clean, dilated_crop = preprocess(raw)
+    gray, binary_clean, dilated_crop, metrics = preprocess(
+        raw,
+        nlm_h        = _nlm_h,
+        bilateral    = _bilateral,
+        otsu_bias    = _otsu_bias,
+        dilate_kernel= dilate_kernel,
+        dilate_iters = dilate_iters,
+    )
     cv2.imwrite(os.path.join(out_dir, "01a_gray.png"),         gray)
     cv2.imwrite(os.path.join(out_dir, "01b_binary_clean.png"), binary_clean)
     cv2.imwrite(os.path.join(out_dir, "01c_dilated_crop.png"), dilated_crop)
+
+    # Save quality metrics as a text report
+    metrics_path = os.path.join(out_dir, "01_quality_metrics.txt")
+    with open(metrics_path, "w") as f:
+        f.write("Preprocessing Quality Metrics\n")
+        f.write("=" * 40 + "\n")
+        f.write(f"Image        : {image_path}\n")
+        f.write(f"NLM h        : {nlm_h}\n")
+        f.write(f"Bilateral    : {bilateral}\n")
+        f.write(f"Otsu bias    : {otsu_bias}\n")
+        f.write(f"Dilate kernel: {dilate_kernel}  iters={dilate_iters}\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"PSNR              : {metrics['psnr']} dB\n")
+        f.write(f"  (Higher = more signal preserved after denoising)\n")
+        f.write(f"SSIM              : {metrics['ssim']}\n")
+        f.write(f"  (1.0 = perfect structural similarity to original)\n")
+        f.write(f"Laplacian variance: {metrics['laplacian_var']}\n")
+        f.write(f"  (Higher = sharper binarised image, better edges)\n")
+        f.write(f"Edge retention    : {metrics['edge_retention']*100:.1f}%\n")
+        f.write(f"  (Fraction of original character edges preserved)\n")
+        f.write("-" * 40 + "\n")
+        f.write("Reference paper benchmarks (Ch.7.1.1):\n")
+        f.write("  Avg success rate on 100 estampages: 95%+\n")
+        f.write("  F1 on 6 sample images: >90% all, 100% on 4/6\n")
+    print(f"  Quality metrics saved -> {metrics_path}")
 
     # Step 2
     print("\n[2] Crop to inscription region ...")
@@ -1023,10 +1582,9 @@ def run_module1(image_path: str,
     print(f"  Crop bbox: {bbox}")
 
     # Step 3
-    print(f"\n[3] Noise removal (white={white_noise_thresh}, "
-          f"black={black_noise_thresh}) ...")
-    p1, inv, denoised = noise_removal(cropped, white_noise_thresh,
-                                      black_noise_thresh)
+    print(f"\n[3] Noise removal (white={_white_thresh}, "
+          f"black={_black_thresh}) ...")
+    p1, inv, denoised = noise_removal(cropped, _white_thresh, _black_thresh)
     cv2.imwrite(os.path.join(out_dir, "03a_pass1.png"),    p1)
     cv2.imwrite(os.path.join(out_dir, "03b_inverted.png"), inv)
     cv2.imwrite(os.path.join(out_dir, "03c_denoised.png"), denoised)
@@ -1059,7 +1617,13 @@ def run_module1(image_path: str,
     print(f"\n[7] Placing {count-1} boundaries for {count} characters ...")
     boundaries = place_boundaries(
         detail["proj_s"], count, rectified.shape[1], rectified)
-    print(f"  Boundaries: {boundaries}")
+    print(f"  Raw boundaries ({len(boundaries)-1} cuts): {boundaries}")
+
+    # Step 7b — Boundary quality filter
+    print(f"\n[7b] Filtering weak boundaries ...")
+    boundaries = filter_weak_boundaries(
+        boundaries, detail["proj_s"], _gap_floor)
+    print(f"  After filter ({len(boundaries)-1} cuts): {boundaries}")
 
     # Step 8
     print("\n[8] Segment validation and MZS split ...")
@@ -1106,22 +1670,41 @@ def run_module1(image_path: str,
     print(f"  Flow type        : {baseline['flow_type'].upper()}")
     print(f"  Curvature        : {baseline['curvature']:.1f} px")
     print(f"  Tilt angle       : {baseline['angle_deg']:.1f} deg")
-    print(f"  Gap floor used   : {gap_floor_ratio*100:.0f}% of max projection")
-    print(f"  Output dir       : {out_dir}")
+    print(f"  Gap floor used   : {_gap_floor*100:.0f}% of max projection "
+          f"({'auto' if auto_params else 'manual'})")
+    print(f"  NLM h used       : {_nlm_h}  "
+          f"noise_thresh={_white_thresh}/{_black_thresh}")
     print(f"{'─'*64}")
-    print(f"  TIP: if count is wrong, adjust --gap_floor")
-    print(f"    Too many chars? RAISE --gap_floor (e.g. 0.55)")
-    print(f"    Too few chars?  LOWER --gap_floor (e.g. 0.35)")
+    print(f"  Preprocessing quality (ref paper metrics):")
+    print(f"    PSNR            : {metrics['psnr']} dB")
+    print(f"    SSIM            : {metrics['ssim']}")
+    print(f"    Laplacian var   : {metrics['laplacian_var']:.0f}")
+    print(f"    Edge retention  : {metrics['edge_retention']*100:.1f}%")
+    print(f"{'─'*64}")
+    print(f"  TIP: auto_params=True (default) → parameters auto-tuned per image")
+    print(f"  TIP: override any param via CLI flags, e.g. --gap_floor 0.55")
+    print(f"  TIP: use --no_auto to disable auto-calibration (full manual)")
+    print(f"  Output dir       : {out_dir}")
     print(f"{'─'*64}\n")
 
     return {
-        "chars":         chars,
-        "count":         len(clusters),
-        "confidence":    conf,
-        "flow_type":     baseline["flow_type"],
-        "baseline_info": baseline,
-        "clusters":      clusters,
-        "proj_detail":   detail,
+        "chars":             chars,
+        "count":             len(clusters),
+        "confidence":        conf,
+        "flow_type":         baseline["flow_type"],
+        "baseline_info":     baseline,
+        "clusters":          clusters,
+        "proj_detail":       detail,
+        "quality_metrics":   metrics,
+        "params_used":       {
+            "nlm_h":              _nlm_h,
+            "bilateral":          _bilateral,
+            "otsu_bias":          _otsu_bias,
+            "white_noise_thresh": _white_thresh,
+            "black_noise_thresh": _black_thresh,
+            "gap_floor_ratio":    _gap_floor,
+            "auto_params":        auto_params,
+        },
     }
 
 
@@ -1141,17 +1724,23 @@ def batch_process(input_dir, out_root="batch_output", **kwargs):
         od = os.path.join(out_root, img_path.stem)
         try:
             r = run_module1(str(img_path), out_dir=od, **kwargs)
+            m = r.get("quality_metrics", {})
             summary.append((img_path.name, r["count"],
-                            r["confidence"], r["flow_type"]))
+                            r["confidence"], r["flow_type"],
+                            m.get("psnr", 0), m.get("ssim", 0),
+                            m.get("edge_retention", 0)))
         except Exception as e:
             print(f"  ERROR {img_path.name}: {e}")
-            summary.append((img_path.name, -1, "error", "?"))
+            summary.append((img_path.name, -1, "error", "?", 0, 0, 0))
 
-    print("\n" + "=" * 62)
-    print(f"{'Image':<32} {'Count':>6}  {'Conf':<8} {'Flow'}")
-    print("-" * 62)
-    for name, cnt, conf, flow in summary:
-        print(f"{name:<32} {str(cnt) if cnt>=0 else 'FAIL':>6}  {conf:<8} {flow}")
+    print("\n" + "=" * 80)
+    print(f"{'Image':<28} {'Count':>6}  {'Conf':<8} {'Flow':<9} "
+          f"{'PSNR':>7}  {'SSIM':>6}  {'EdgeRet':>8}")
+    print("-" * 80)
+    for name, cnt, conf, flow, psnr, ssim, edg in summary:
+        c = str(cnt) if cnt >= 0 else "FAIL"
+        print(f"{name:<28} {c:>6}  {conf:<8} {flow:<9} "
+              f"{psnr:>7.1f}  {ssim:>6.3f}  {edg*100:>7.1f}%")
 
 
 # ======================================================================
@@ -1161,26 +1750,68 @@ def batch_process(input_dir, out_root="batch_output", **kwargs):
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(
-        description="Module 1 - Brahmi Inscription Segmentation")
+        description="Module 1 - Brahmi Inscription Preprocessing & Segmentation",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("input",
-                    help="Image file, or directory with --batch")
+                    help="Image file, or directory (use --batch)")
     ap.add_argument("--out",          default="output_module1")
-    ap.add_argument("--white_thresh", type=int,   default=200)
-    ap.add_argument("--black_thresh", type=int,   default=200)
-    ap.add_argument("--mzs",          type=float, default=3.0,
-                    help="Modified Z-Score threshold for wide-segment splitting (default 3.0)")
-    ap.add_argument("--gap_floor",    type=float, default=0.45,
-                    help="Gap-floor ratio 0-1 (default 0.45). "
-                         "RAISE if too many chars, LOWER if too few.")
-    ap.add_argument("--show",         action="store_true")
-    ap.add_argument("--batch",        action="store_true")
+
+    # ── Preprocessing (new — from reference paper Ch.6) ─────────────────
+    grp_pre = ap.add_argument_group("Preprocessing (reference paper additions)")
+    grp_pre.add_argument("--nlm_h",         type=int,   default=10,
+                         help="Non-Local Means filter strength. "
+                              "Higher=more smoothing. "
+                              "Try 20-30 for very noisy scans.")
+    grp_pre.add_argument("--bilateral",     action="store_true", default=True,
+                         help="Add bilateral edge-preserving filter after NLMeans "
+                              "(default ON). Disable with --no_bilateral.")
+    grp_pre.add_argument("--no_bilateral",  dest="bilateral", action="store_false",
+                         help="Disable bilateral filter (already-clean images).")
+    grp_pre.add_argument("--otsu_bias",     type=int,   default=20,
+                         help="Bias subtracted from Otsu threshold. "
+                              "Lower for faded inscriptions.")
+    grp_pre.add_argument("--dilate_kernel", type=int,   nargs=2, default=[3, 3],
+                         metavar=("W", "H"),
+                         help="Morphological closing kernel size. "
+                              "Use '5 5' for heavily fragmented strokes.")
+    grp_pre.add_argument("--dilate_iters",  type=int,   default=1,
+                         help="Morphological closing iterations. "
+                              "Increase for low-DPI images.")
+
+    # ── Noise removal ────────────────────────────────────────────────────
+    grp_noise = ap.add_argument_group("Noise removal (CCA size filters)")
+    grp_noise.add_argument("--white_thresh", type=int, default=200,
+                            help="White cluster removal threshold (px²).")
+    grp_noise.add_argument("--black_thresh", type=int, default=200,
+                            help="Black cluster removal threshold (px²).")
+
+    # ── Segmentation ─────────────────────────────────────────────────────
+    grp_seg = ap.add_argument_group("Segmentation")
+    grp_seg.add_argument("--mzs",       type=float, default=3.0,
+                         help="Modified Z-Score threshold for wide-segment split.")
+    grp_seg.add_argument("--gap_floor", type=float, default=0.45,
+                         help="Gap-floor ratio 0-1. "
+                              "RAISE if too many chars, LOWER if too few.")
+
+    ap.add_argument("--show",    action="store_true", help="Show matplotlib plots.")
+    ap.add_argument("--batch",   action="store_true", help="Process whole directory.")
+    ap.add_argument("--no_auto", action="store_true",
+                    help="Disable auto-calibration. Use explicit flags for all params.")
     args = ap.parse_args()
 
-    kw = dict(white_noise_thresh=args.white_thresh,
-              black_noise_thresh=args.black_thresh,
-              mzs_threshold=args.mzs,
-              gap_floor_ratio=args.gap_floor,
-              show_plots=args.show)
+    kw = dict(
+        white_noise_thresh = args.white_thresh  if args.no_auto else None,
+        black_noise_thresh = args.black_thresh  if args.no_auto else None,
+        mzs_threshold      = args.mzs,
+        gap_floor_ratio    = args.gap_floor     if args.no_auto else None,
+        nlm_h              = args.nlm_h         if args.no_auto else None,
+        bilateral          = args.bilateral,
+        otsu_bias          = args.otsu_bias     if args.no_auto else None,
+        dilate_kernel      = tuple(args.dilate_kernel),
+        dilate_iters       = args.dilate_iters,
+        auto_params        = not args.no_auto,
+        show_plots         = args.show,
+    )
 
     if args.batch:
         batch_process(args.input, out_root=args.out, **kw)
