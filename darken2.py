@@ -1594,30 +1594,53 @@ def auto_calibrate(image_path: str) -> dict:
 
 def remove_border_blobs(binary_img):
     """
-    Remove connected components that TOUCH the image border.
-
-    Border-touching blobs = bright paper background, mounting frames,
-    or scanning artefacts — never genuine inscription characters.
-    Removing them prevents the brightness of the border from contaminating
-    the horizontal projection and baseline detection.
+    Slices off huge border noise while perfectly preserving letters.
+    Uses a morphological 'opening' trick to sever thin bridges between
+    characters and the border noise, then deletes the isolated border chunks.
     """
     H, W = binary_img.shape[:2]
-    out  = binary_img.copy()
-    n, lbl, st, _ = cv2.connectedComponentsWithStats(out, connectivity=8)
 
-    removed = 0
+    # Step 1: Break the thin bridges connecting text to the borders
+    # A 5x5 kernel is usually perfect for snapping these false connections.
+    sever_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    opened = cv2.morphologyEx(binary_img, cv2.MORPH_OPEN, sever_kernel, iterations=1)
+
+    # Step 2: Run connected components on the OPENED (disconnected) image
+    n, lbl, st, _ = cv2.connectedComponentsWithStats(opened, connectivity=8)
+
+    # Step 3: Build a mask of ONLY the massive border noise
+    noise_mask = np.zeros((H, W), dtype=np.uint8)
+    removed_count = 0
+
     for i in range(1, n):
-        x  = st[i, cv2.CC_STAT_LEFT]
-        y  = st[i, cv2.CC_STAT_TOP]
-        w  = st[i, cv2.CC_STAT_WIDTH]
-        h  = st[i, cv2.CC_STAT_HEIGHT]
-        touches = (x == 0 or y == 0 or
-                   x + w >= W or y + h >= H)
-        if touches:
-            out[lbl == i] = 0
-            removed += 1
+        x = int(st[i, cv2.CC_STAT_LEFT])
+        y = int(st[i, cv2.CC_STAT_TOP])
+        w = int(st[i, cv2.CC_STAT_WIDTH])
+        h = int(st[i, cv2.CC_STAT_HEIGHT])
+        area = st[i, cv2.CC_STAT_AREA]
 
-    print(f"  Border blob removal: {removed} border-touching components removed")
+        touches_border = (x == 0 or y == 0 or x + w >= W or y + h >= H)
+
+        # Identify as noise if it touches the edge AND:
+        # A) It is confined to the top/bottom margins, OR
+        # B) It is a massive heavy block (e.g., > 4% of total image area)
+        is_marginal = (y + h < H * 0.35) or (y > H * 0.65)
+        is_huge_block = area > (H * W * 0.04)
+
+        if touches_border and (is_marginal or is_huge_block):
+            noise_mask[lbl == i] = 255
+            removed_count += 1
+
+    # Step 4: Re-expand the noise mask slightly.
+    # Because 'opening' shrank the noise, we dilate the mask so it completely
+    # covers the noise footprint in the original image.
+    noise_mask = cv2.dilate(noise_mask, sever_kernel, iterations=2)
+
+    # Step 5: Subtract the noise mask from the ORIGINAL, un-shrunk binary image.
+    # This leaves your letters pristine and un-degraded!
+    out = cv2.bitwise_and(binary_img, cv2.bitwise_not(noise_mask))
+
+    print(f"  Border blob removal: Severed and removed {removed_count} massive border chunks")
     return out
 
 
