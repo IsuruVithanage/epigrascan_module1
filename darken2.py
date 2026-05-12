@@ -216,8 +216,131 @@ def crop_to_inscription(dilated_crop, binary_clean, pad=8):
 
 
 # ======================================================================
-# 3.  TWO-PASS NOISE REMOVAL
+# 3b.  CHARACTER BAND EXTRACTION  (spline-guided noise removal)
 # ======================================================================
+
+def extract_character_band(binary_img, padding: int = 12,
+                           band_height_factor: float = 1.3,
+                           save_vis_path: str = None) -> tuple:
+    """
+    Permanently remove noise outside the character text band by masking
+    pixels that lie above/below the fitted inscription baseline.
+
+    Root cause of the old failure
+    ──────────────────────────────
+    The previous sliding-window "peak-row" approach chose the row with the
+    MOST white pixels per column strip. For inscriptions with a solid stone
+    texture band at the bottom, that band always wins — it has more pixels
+    per row than the sparse character strokes above it.
+
+    Correct approach
+    ─────────────────
+    Use detect_baseline() which fits a polynomial to CCA component CENTROIDS
+    filtered by area. This correctly identifies the character region because:
+      • Character components have intermediate areas (not tiny specks,
+        not the massive connected stone blob)
+      • The polynomial fit through their centroids follows the text flow
+      • It is immune to the solid noise band which appears as one giant
+        component (area >> threshold) and gets excluded
+
+    Algorithm
+    ─────────
+    1. Run detect_baseline on the noisy binary → get baseline polynomial.
+    2. Estimate character half-height from CCA components whose centroids
+       are NEAR the baseline (within ±30px), excluding outliers.
+    3. For every column x:
+         allowed_y = [baseline(x) − half_h − padding,
+                      baseline(x) + half_h + padding]
+       Zero all pixels outside this range.
+    4. Optionally save a debug visualisation.
+
+    Parameters
+    ──────────
+    binary_img          : WHITE text on BLACK background
+    padding             : extra margin above/below band in pixels (default 12)
+    band_height_factor  : band_half = median_char_height × this factor (1.3)
+    save_vis_path       : path to save green-spline / red-boundary debug image
+
+    Returns
+    ───────
+    (masked_binary, baseline_info, band_half)
+    """
+    H, W = binary_img.shape[:2]
+
+    # ── Step 1: detect_baseline gives us the correct band centre ─────────
+    baseline = detect_baseline(binary_img)
+    poly     = baseline["poly"]
+
+    # ── Step 2: estimate character height from NEAR-BASELINE components ──
+    n, lbl, st, cent = cv2.connectedComponentsWithStats(
+        binary_img, connectivity=8)
+
+    img_area   = H * W
+    near_heights = []
+    for i in range(1, n):
+        area = int(st[i, cv2.CC_STAT_AREA])
+        # Skip too-small (noise specks) and too-large (noise blob)
+        if area < 30 or area > img_area * 0.03:
+            continue
+        cy    = float(cent[i][1])
+        cx    = float(cent[i][0])
+        bl_y  = float(poly(cx))
+        dist  = abs(cy - bl_y)
+        if dist < 40:                           # within 40px of baseline
+            near_heights.append(int(st[i, cv2.CC_STAT_HEIGHT]))
+
+    if near_heights:
+        med_h = float(np.median(near_heights))
+    else:
+        # Fallback: use all character-scale component heights
+        all_h = [int(st[i, cv2.CC_STAT_HEIGHT])
+                 for i in range(1, n)
+                 if 30 <= int(st[i, cv2.CC_STAT_AREA]) <= img_area * 0.03]
+        med_h = float(np.median(all_h)) if all_h else H * 0.25
+
+    band_half = max(int(med_h * band_height_factor),
+                    int(H * 0.18))   # at least 18% of image height
+
+    print(f"  Band: baseline_flow={baseline['flow_type']}  "
+          f"median_char_h={med_h:.0f}px  "
+          f"band_half={band_half}px  total={2*(band_half+padding)}px  "
+          f"image_H={H}px")
+
+    # ── Step 3: apply band mask ───────────────────────────────────────────
+    mask = np.zeros((H, W), dtype=np.uint8)
+    for col in range(W):
+        cy = int(np.clip(float(poly(col)), 0, H - 1))
+        y0 = max(0, cy - band_half - padding)
+        y1 = min(H, cy + band_half + padding)
+        mask[y0:y1, col] = 255
+
+    masked = cv2.bitwise_and(binary_img, mask)
+
+    n_before = cv2.connectedComponentsWithStats(binary_img, connectivity=8)[0] - 1
+    n_after  = cv2.connectedComponentsWithStats(masked,     connectivity=8)[0] - 1
+    print(f"  Noise components removed: {n_before - n_after}  "
+          f"({n_before} → {n_after})")
+
+    # ── Step 4: optional debug visualisation ─────────────────────────────
+    if save_vis_path:
+        vis = cv2.cvtColor(binary_img, cv2.COLOR_GRAY2BGR)
+        for col in range(W - 1):
+            cy  = int(np.clip(float(poly(col)),     0, H - 1))
+            cy2 = int(np.clip(float(poly(col + 1)), 0, H - 1))
+            # Spline baseline (green)
+            cv2.line(vis, (col, cy), (col + 1, cy2), (0, 220, 0), 2)
+            # Band boundaries (red)
+            y0 = max(0, cy - band_half - padding)
+            y1 = min(H - 1, cy + band_half + padding)
+            if 0 <= y0 < H: vis[y0, col] = [0, 0, 255]
+            if 0 <= y1 < H: vis[y1, col] = [0, 0, 255]
+        cv2.imwrite(save_vis_path, vis)
+        print(f"  Band vis → {save_vis_path}")
+
+    return masked, baseline, band_half
+
+
+
 
 def _cca_filter(img, threshold, kill_color, replace_color):
     mask = img if kill_color == 255 else cv2.bitwise_not(img)
@@ -293,26 +416,86 @@ def _get_char_centroids(binary):
     return comps
 
 
+def _cluster_centroids_by_row(chars, H):
+    """
+    Split centroids into row-groups using KDE valley detection.
+
+    Why KDE instead of sorted-gap detection
+    ─────────────────────────────────────────
+    Simple gap detection (find large gaps in sorted y values) fails when
+    two text rows are CLOSE together — the gap between rows may be smaller
+    than gaps within one wavy row.
+
+    KDE approach:
+    1. Build a histogram of centroid y-values and smooth with Gaussian σ=6px.
+    2. Find VALLEYS in the KDE — valleys in the y-density are row separators.
+    3. Split centroids at each valley.
+    4. Sort groups by total area (dominant / most-character row first).
+
+    If no valley is found the single group is returned unchanged.
+    """
+    if not chars:
+        return [chars]
+
+    # Build and smooth y-histogram
+    y_hist = np.zeros(H)
+    for c in chars:
+        idx = int(np.clip(c["cy"], 0, H - 1))
+        y_hist[idx] += 1
+    kde = gaussian_filter1d(y_hist, sigma=6)
+
+    if kde.max() == 0:
+        return [chars]
+
+    # Find valleys in KDE = row separator positions
+    inv_kde     = kde.max() - kde
+    valleys, _  = find_peaks(
+        inv_kde,
+        height=kde.max() * 0.25,       # valley must dip to < 75% of peak
+        distance=max(10, int(H * 0.10)),
+        prominence=kde.max() * 0.15,   # valley must be prominent
+    )
+
+    if len(valleys) == 0:
+        return [chars]   # single row — no separator found
+
+    # Split centroids at each valley
+    separators = sorted(int(v) for v in valleys)
+    groups     = []
+    prev_sep   = -1
+    for sep in separators + [H + 1]:
+        group = [c for c in chars if prev_sep < c["cy"] <= sep]
+        if group:
+            groups.append(group)
+        prev_sep = sep
+
+    if not groups:
+        return [chars]
+
+    # Sort by total area descending (dominant row first)
+    groups.sort(key=lambda g: sum(c["area"] for c in g), reverse=True)
+
+    print(f"  Baseline row-split: KDE found {len(valleys)} valley(s) at "
+          f"y={separators} → {len(groups)} row group(s)  "
+          f"sizes={[len(g) for g in groups]}")
+    return groups
+
+
 def detect_baseline(binary_img):
     """
-    Fit a polynomial to centroid y-coordinates vs x.
+    Fit a polynomial baseline through ALL character centroids.
 
-    Degree 1 -> linear (straight)
-    Degree 2 -> quadratic (curved)
-    Degree 3 -> cubic (wavy)
-
-    Upgrade degree only when residual drops >= 30%.
-
-    Returns dict with: flow_type, poly, degree, residual_std,
-                       curvature, angle_deg, centroids, image_W, image_H
+    Key fix (matching Phoenix team approach): fit ALL centroids first.
+    For a curved inscription, centroids span the full y-range of the wave.
+    Pre-splitting by row discards the dip/rise centroids that DEFINE the
+    curve, leaving only flat middle points → wrong straight line.
+    Row-splitting is only used as fallback when residual > 22% image height.
     """
-    H, W = binary_img.shape[:2]
+    H, W  = binary_img.shape[:2]
     comps = _get_char_centroids(binary_img)
-
     areas = [c["area"] for c in comps]
     if not areas:
         return _fallback_baseline(W, H)
-
     thresh = max(50, float(np.percentile(areas, 30)))
     chars  = [c for c in comps if c["area"] >= thresh]
     if len(chars) < 3:
@@ -321,51 +504,83 @@ def detect_baseline(binary_img):
     xs = np.array([c["cx"] for c in chars])
     ys = np.array([c["cy"] for c in chars])
 
-    fits = {}
-    for deg in [1, 2, 3]:
-        cf   = np.polyfit(xs, ys, deg)
-        poly = np.poly1d(cf)
-        resid = ys - poly(xs)
-        fits[deg] = {"cf": cf, "poly": poly, "std": float(np.std(resid))}
+    def _fit_and_select(xs_, ys_, label=""):
+        fits_ = {}
+        for deg in range(1, min(4, len(xs_))):
+            cf   = np.polyfit(xs_, ys_, deg)
+            poly = np.poly1d(cf)
+            xs_f = np.linspace(0, W, 300)
+            ys_f = poly(xs_f)
+            fits_[deg] = {"cf": cf, "poly": poly,
+                          "std":  float(np.std(ys_ - poly(xs_))),
+                          "curv": float(ys_f.max() - ys_f.min())}
+        for d in [1, 2, 3]:
+            if d not in fits_:
+                fits_[d] = fits_[max(fits_.keys())]
+        def _up(lo, hi):
+            sl,sh = fits_[lo]["std"], fits_[hi]["std"]
+            cl,ch = fits_[lo]["curv"],fits_[hi]["curv"]
+            return ((sl-sh)/max(sl,1e-6)*100 >= 10.0 or
+                    (ch-cl >= 12.0 and sh <= sl*1.05))
+        ch = 1
+        if _up(1,2): ch = 2
+        if ch==2 and _up(2,3): ch = 3
+        if label:
+            print(f"  Baseline{label}: deg{ch}  "
+                  f"std={fits_[ch]['std']:.1f}px  curv={fits_[ch]['curv']:.1f}px")
+        return fits_, ch
 
-    chosen = 1
-    if fits[2]["std"] < fits[1]["std"] * 0.70:
-        chosen = 2
-    if fits[3]["std"] < fits[2]["std"] * 0.70:
-        chosen = 3
+    # Step 1: fit ALL centroids
+    fits, chosen = _fit_and_select(xs, ys, " (all pts)")
 
-    poly  = fits[chosen]["poly"]
-    std   = fits[chosen]["std"]
-    xs_f  = np.linspace(0, W, 300)
-    ys_f  = poly(xs_f)
-    curv  = float(ys_f.max() - ys_f.min())
+    # Step 2: RANSAC using chosen polynomial (not linear!)
+    best_poly = fits[chosen]["poly"]
+    inlier    = np.abs(ys - best_poly(xs)) <= max(20.0, fits[chosen]["std"]*2.0)
+    if inlier.sum() >= 3 and inlier.sum() < len(xs):
+        print(f"  Baseline RANSAC: removed {(~inlier).sum()} outlier(s), "
+              f"kept {inlier.sum()}/{len(xs)}")
+        xs, ys = xs[inlier], ys[inlier]
+        fits, chosen = _fit_and_select(xs, ys, " (after RANSAC)")
 
-    if chosen == 1 and std < 0.05 * H:
-        flow = "straight"
-    elif curv < 0.08 * H:
-        flow = "straight"
-    elif chosen == 2:
-        flow = "curved"
-    else:
-        flow = "wavy"
+    # Step 3: row-split fallback (only if residual still very large)
+    if fits[chosen]["std"] > H * 0.22 and len(chars) >= 6:
+        print(f"  Baseline: std too large -> trying row-split fallback")
+        row_groups = _cluster_centroids_by_row(chars, H)
+        if len(row_groups) > 1 and len(row_groups[0]) >= 3:
+            xs_d = np.array([c["cx"] for c in row_groups[0]])
+            ys_d = np.array([c["cy"] for c in row_groups[0]])
+            fits_d, ch_d = _fit_and_select(xs_d, ys_d, " (dominant row)")
+            if fits_d[ch_d]["std"] < fits[chosen]["std"] * 0.85:
+                fits, chosen, xs, ys = fits_d, ch_d, xs_d, ys_d
+                print("  Baseline: row-split improved fit -> using dominant row")
 
-    angle = float(np.degrees(np.arctan2(ys[-1]-ys[0], xs[-1]-xs[0]))) \
-            if len(xs) >= 2 else 0.0
+    poly = fits[chosen]["poly"]
+    std  = fits[chosen]["std"]
+    curv = fits[chosen]["curv"]
+    xs_f = np.linspace(0, W, 300)
+    ys_f = poly(xs_f)
+
+    if chosen == 1 and std < 0.05*H: flow = "straight"
+    elif curv < 0.08*H:              flow = "straight"
+    elif chosen == 2:                 flow = "curved"
+    else:                             flow = "wavy"
+
+    angle = (float(np.degrees(np.arctan2(
+                float(ys[-1])-float(ys[0]),
+                float(xs[-1])-float(xs[0]))))
+             if len(xs) >= 2 else 0.0)
 
     print(f"  Baseline: flow={flow}  degree={chosen}  "
-          f"curvature={curv:.1f}px  residual_std={std:.1f}px  tilt={angle:.1f}deg")
+          f"curvature={curv:.1f}px  residual_std={std:.1f}px  "
+          f"tilt={angle:.1f}deg  pts_used={len(xs)}")
 
-    return {
-        "flow_type":    flow,
-        "poly":         poly,
-        "poly_coeffs":  fits[chosen]["cf"],
-        "degree":       chosen,
-        "residual_std": std,
-        "curvature":    curv,
-        "angle_deg":    angle,
-        "centroids":    list(zip(xs.tolist(), ys.tolist())),
-        "image_W": W, "image_H": H,
-    }
+    return {"flow_type": flow, "poly": poly,
+            "poly_coeffs": fits[chosen]["cf"],
+            "degree": chosen, "residual_std": std, "curvature": curv,
+            "angle_deg": angle,
+            "centroids": list(zip(xs.tolist(), ys.tolist())),
+            "image_W": W, "image_H": H}
+
 
 
 def _fallback_baseline(W, H):
@@ -1313,6 +1528,201 @@ def vis_pipeline(stages, out_path):
 
 def auto_calibrate(image_path: str) -> dict:
     """
+    Automatically measure image characteristics and return optimal parameters.
+    Measurements: noise_ratio, contrast, fg_ratio, blob_ratio.
+    """
+    raw  = cv2.imread(image_path)
+    if raw is None:
+        raise FileNotFoundError(f"Cannot read: {image_path}")
+    gray = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY) if raw.ndim == 3 else raw
+    H, W = gray.shape[:2]
+
+    lap         = cv2.Laplacian(gray.astype(float), cv2.CV_64F)
+    dyn_range   = max(1.0, float(gray.max()) - float(gray.min()))
+    noise_ratio = float(np.abs(lap).mean()) / dyn_range
+    contrast    = float(np.percentile(gray, 95) - np.percentile(gray, 5))
+
+    _, bw      = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    fg_ratio   = float(np.mean(bw == 255))
+    if fg_ratio > 0.55:
+        fg_ratio = 1.0 - fg_ratio
+
+    den_quick  = cv2.fastNlMeansDenoising(gray, None, h=15,
+                                          templateWindowSize=7, searchWindowSize=21)
+    _, bw2     = cv2.threshold(den_quick, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(bw2 == 255) > 0.55:
+        bw2 = cv2.bitwise_not(bw2)
+    n2, _, st2, _ = cv2.connectedComponentsWithStats(bw2, connectivity=8)
+    areas2     = [int(st2[i, cv2.CC_STAT_AREA]) for i in range(1, n2)]
+    blob_ratio = float(max(areas2)) / (H * W) if areas2 else 0.0
+
+    print(f"  Auto-calibrate:  noise_ratio={noise_ratio:.4f}  "
+          f"contrast={contrast:.0f}  fg_ratio={fg_ratio:.3f}  "
+          f"blob_ratio={blob_ratio:.4f}")
+
+    if noise_ratio < 0.05:    nlm_h = 5
+    elif noise_ratio < 0.08:  nlm_h = 10
+    elif noise_ratio < 0.12:  nlm_h = 18
+    elif noise_ratio < 0.18:  nlm_h = 25
+    else:                     nlm_h = 30
+
+    otsu_bias    = 30 if contrast < 150 else 20
+
+    if noise_ratio < 0.06:    noise_thresh = 50
+    elif noise_ratio < 0.10:  noise_thresh = 100
+    elif noise_ratio < 0.15:  noise_thresh = 150
+    else:                     noise_thresh = 200
+
+    if blob_ratio > 0.15:     gap_floor = 0.30
+    elif blob_ratio > 0.08:   gap_floor = 0.35
+    elif noise_ratio > 0.12:  gap_floor = 0.40
+    elif noise_ratio > 0.06:  gap_floor = 0.45
+    else:                     gap_floor = 0.55
+
+    params = {
+        "nlm_h": nlm_h, "bilateral": True, "otsu_bias": otsu_bias,
+        "dilate_kernel": (3, 3), "dilate_iters": 1,
+        "white_noise_thresh": noise_thresh, "black_noise_thresh": noise_thresh,
+        "gap_floor_ratio": gap_floor, "mzs_threshold": 3.0,
+        "_noise_ratio": round(noise_ratio, 4), "_contrast": round(contrast, 1),
+        "_fg_ratio": round(fg_ratio, 3), "_blob_ratio": round(blob_ratio, 4),
+    }
+    print(f"  → nlm_h={nlm_h}  noise_thresh={noise_thresh}  "
+          f"gap_floor={gap_floor}  otsu_bias={otsu_bias}")
+    return params
+
+
+def remove_border_blobs(binary_img):
+    """
+    Remove connected components that TOUCH the image border.
+
+    Border-touching blobs = bright paper background, mounting frames,
+    or scanning artefacts — never genuine inscription characters.
+    Removing them prevents the brightness of the border from contaminating
+    the horizontal projection and baseline detection.
+    """
+    H, W = binary_img.shape[:2]
+    out  = binary_img.copy()
+    n, lbl, st, _ = cv2.connectedComponentsWithStats(out, connectivity=8)
+
+    removed = 0
+    for i in range(1, n):
+        x  = st[i, cv2.CC_STAT_LEFT]
+        y  = st[i, cv2.CC_STAT_TOP]
+        w  = st[i, cv2.CC_STAT_WIDTH]
+        h  = st[i, cv2.CC_STAT_HEIGHT]
+        touches = (x == 0 or y == 0 or
+                   x + w >= W or y + h >= H)
+        if touches:
+            out[lbl == i] = 0
+            removed += 1
+
+    print(f"  Border blob removal: {removed} border-touching components removed")
+    return out
+
+
+def detect_text_rows(binary_img, min_row_height_frac=0.10):
+    """
+    Detect how many text rows exist using horizontal projection analysis.
+
+    Characters in a multi-row inscription produce PEAKS in the row-wise
+    white-pixel sum.  Valleys between peaks = row separators.
+
+    Returns
+    ───────
+    row_bands : list of (y_start, y_end) tuples, one per detected text row.
+                Each band includes the full vertical extent of that row.
+    n_rows    : number of text rows found (1 or more)
+    """
+    H, W     = binary_img.shape[:2]
+    h_proj   = np.sum(binary_img == 255, axis=1).astype(float)
+    h_smooth = gaussian_filter1d(h_proj, sigma=4)
+
+    # Threshold: rows with significant character content
+    threshold    = max(h_smooth.max() * 0.12, 5.0)
+    active       = (h_smooth >= threshold).astype(int)
+
+    # Find contiguous active bands
+    bands = []
+    in_band, start = False, 0
+    for y in range(H):
+        if active[y] and not in_band:
+            start, in_band = y, True
+        elif not active[y] and in_band:
+            bands.append((start, y))
+            in_band = False
+    if in_band:
+        bands.append((start, H))
+
+    # Merge bands that are very close together (< 8px gap)
+    merged = []
+    for band in bands:
+        if merged and band[0] - merged[-1][1] < 8:
+            merged[-1] = (merged[-1][0], band[1])
+        else:
+            merged.append(list(band))
+
+    # Filter out tiny bands (< min_row_height_frac * H)
+    min_h = max(8, int(H * min_row_height_frac))
+    merged = [(s, e) for s, e in merged if e - s >= min_h]
+
+    n_rows = len(merged)
+    print(f"  Text row detection: {n_rows} row(s) found — "
+          f"{[(s, e, e-s) for s, e in merged]}")
+
+    if not merged:
+        return [(0, H)], 1   # fallback: full image is one row
+
+    return merged, n_rows
+
+
+def segment_one_row(binary_row, row_y_offset, gap_floor_ratio,
+                    mzs_threshold, out_dir, row_idx):
+    """
+    Run the full segmentation pipeline on ONE text row strip.
+    Returns list of cluster dicts with y-coordinates adjusted by row_y_offset.
+    """
+    if np.sum(binary_row == 255) < 50:
+        return []
+
+    # Baseline + rectification for this row
+    baseline = detect_baseline(binary_row)
+    rectified, _ = rectify(binary_row, baseline)
+
+    # Count characters in this row
+    count, conf, detail = count_characters(rectified, baseline)
+
+    # Save per-row signals
+    vis_path = os.path.join(out_dir, f"row{row_idx:02d}_signals.png")
+    vis_count_signals(detail["proj_s"], detail, count, conf,
+                      rectified.shape[1], vis_path)
+
+    # Place boundaries and validate
+    boundaries = place_boundaries(
+        detail["proj_s"], count, rectified.shape[1], rectified)
+    boundaries = filter_weak_boundaries(
+        boundaries, detail["proj_s"], gap_floor_ratio)
+    clusters = validate_and_split(
+        boundaries, detail["proj_s"],
+        rectified.shape[1], rectified, mzs_thresh=mzs_threshold)
+    clusters = post_merge_narrow_segments(
+        clusters, rectified, detail["proj_s"])
+
+    # Crop characters for this row
+    chars = crop_characters(rectified, clusters)
+
+    print(f"  Row {row_idx}: count={len(clusters)}  conf={conf}  "
+          f"flow={baseline['flow_type']}")
+
+    # Adjust cluster y-coordinates back to full-image space
+    for c in clusters:
+        c["y"] += row_y_offset
+
+    return clusters, chars, baseline, detail
+
+
+
+    """
     Automatically measure image characteristics and return the optimal
     processing parameters for that specific image.
 
@@ -1589,77 +1999,153 @@ def run_module1(image_path: str,
     cv2.imwrite(os.path.join(out_dir, "03b_inverted.png"), inv)
     cv2.imwrite(os.path.join(out_dir, "03c_denoised.png"), denoised)
 
-    # Step 4
-    print("\n[4] Baseline detection and flow analysis ...")
-    baseline = detect_baseline(denoised)
-    vis_baseline(denoised, baseline,
-                 os.path.join(out_dir, "04_baseline.png"))
+    # Step 3c — Remove border-touching blobs (white paper/frame artefacts)
+    print("\n[3c] Removing border-touching noise blobs ...")
+    denoised = remove_border_blobs(denoised)
+    cv2.imwrite(os.path.join(out_dir, "03c2_no_border.png"), denoised)
 
-    # Step 5
-    print(f"\n[5] Rectification (flow={baseline['flow_type']}) ...")
-    rectified, col_offsets = rectify(denoised, baseline)
-    cv2.imwrite(os.path.join(out_dir, "05_rectified.png"), rectified)
-    if baseline["flow_type"] == "straight":
-        print("  Straight baseline -> no geometric correction applied")
+    # Step 3b — Character band extraction (spline-guided permanent noise removal)
+    print("\n[3b] Character band extraction ...")
+    denoised, baseline_rough, band_half = extract_character_band(
+        denoised,
+        padding=12,
+        band_height_factor=1.3,
+        save_vis_path=os.path.join(out_dir, "03d_band_vis.png"),
+    )
+    cv2.imwrite(os.path.join(out_dir, "03d_band_masked.png"), denoised)
+
+    # Step 3d — Detect number of text rows
+    print("\n[3d] Detecting text row structure ...")
+    row_bands, n_rows = detect_text_rows(denoised)
+    print(f"  Found {n_rows} text row(s)")
+
+    # ── MULTI-ROW PATH ────────────────────────────────────────────────────
+    if n_rows > 1:
+        print(f"\n[MULTI-ROW] Processing {n_rows} rows independently ...")
+        all_clusters = []
+        all_chars    = []
+        baselines    = []
+
+        for ri, (y0, y1) in enumerate(row_bands):
+            pad      = 5
+            strip_y0 = max(0, y0 - pad)
+            strip_y1 = min(denoised.shape[0], y1 + pad)
+            row_strip = denoised[strip_y0:strip_y1, :]
+            cv2.imwrite(os.path.join(out_dir,
+                        f"row{ri:02d}_strip.png"), row_strip)
+
+            result = segment_one_row(
+                row_strip, strip_y0, _gap_floor,
+                mzs_threshold, out_dir, ri)
+
+            if result:
+                row_clusters, row_chars, row_base, row_detail = result
+                # Re-label globally
+                label_offset = len(all_clusters)
+                for c in row_clusters:
+                    c["label"] += label_offset
+                all_clusters.extend(row_clusters)
+                all_chars.extend(row_chars)
+                baselines.append(row_base)
+
+        clusters = all_clusters
+        chars    = all_chars
+        # Use first row's baseline for visualisation
+        baseline = baselines[0] if baselines else baseline_rough
+
+        # Draw combined segmentation visualisation
+        vis_combined = cv2.cvtColor(denoised, cv2.COLOR_GRAY2BGR)
+        conf = "medium"
+        for c in clusters:
+            x0, y0c = c["x"], max(0, c["y"] - 2)
+            x1, y1c = c["x"] + c["w"], min(denoised.shape[0], c["y"] + c["h"] + 2)
+            cv2.rectangle(vis_combined, (x0, y0c), (x1, y1c), (0, 165, 255), 2)
+            cv2.putText(vis_combined, str(c["label"]),
+                        (x0, max(y0c - 4, 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 165, 255), 1)
+        banner = (f"Characters: {len(clusters)}   "
+                  f"Rows: {n_rows}   Flow: MULTI-ROW")
+        cv2.rectangle(vis_combined, (0, 0), (denoised.shape[1], 26), (25, 25, 25), -1)
+        cv2.putText(vis_combined, banner, (8, 17),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1)
+        cv2.imwrite(os.path.join(out_dir, "08_segmentation.png"), vis_combined)
+        vis_chars_grid(chars, os.path.join(out_dir, "09_chars_grid.png"))
+
+        detail = {"proj": 0, "cca": 0, "gaps": 0,
+                  "valleys": [], "proj_s": np.zeros(10)}
+
     else:
-        print(f"  Curved -> max column shift = {np.abs(col_offsets).max()}px")
+        # ── SINGLE-ROW PATH (original pipeline) ──────────────────────────
+        # Step 4 — Re-detect baseline on the now-clean masked image
+        print("\n[4] Baseline detection on cleaned image ...")
+        baseline = detect_baseline(denoised)
+        vis_baseline(denoised, baseline,
+                     os.path.join(out_dir, "04_baseline.png"))
 
-    # Step 6
-    print("\n[6] Multi-signal character counting ...")
-    count, conf, detail = count_characters(rectified, baseline)
-    vis_count_signals(
-        detail["proj_s"], detail, count, conf,
-        rectified.shape[1],
-        os.path.join(out_dir, "06_count_signals.png")
-    )
+        # Step 5
+        print(f"\n[5] Rectification (flow={baseline['flow_type']}) ...")
+        rectified, col_offsets = rectify(denoised, baseline)
+        cv2.imwrite(os.path.join(out_dir, "05_rectified.png"), rectified)
+        if baseline["flow_type"] == "straight":
+            print("  Straight baseline -> no geometric correction applied")
+        else:
+            print(f"  Curved -> max column shift = {np.abs(col_offsets).max()}px")
 
-    # Step 7
-    print(f"\n[7] Placing {count-1} boundaries for {count} characters ...")
-    boundaries = place_boundaries(
-        detail["proj_s"], count, rectified.shape[1], rectified)
-    print(f"  Raw boundaries ({len(boundaries)-1} cuts): {boundaries}")
+        # Step 6
+        print("\n[6] Multi-signal character counting ...")
+        count, conf, detail = count_characters(rectified, baseline)
+        vis_count_signals(
+            detail["proj_s"], detail, count, conf,
+            rectified.shape[1],
+            os.path.join(out_dir, "06_count_signals.png")
+        )
 
-    # Step 7b — Boundary quality filter
-    print(f"\n[7b] Filtering weak boundaries ...")
-    boundaries = filter_weak_boundaries(
-        boundaries, detail["proj_s"], _gap_floor)
-    print(f"  After filter ({len(boundaries)-1} cuts): {boundaries}")
+        # Step 7
+        print(f"\n[7] Placing {count-1} boundaries for {count} characters ...")
+        boundaries = place_boundaries(
+            detail["proj_s"], count, rectified.shape[1], rectified)
+        print(f"  Raw boundaries ({len(boundaries)-1} cuts): {boundaries}")
 
-    # Step 8
-    print("\n[8] Segment validation and MZS split ...")
-    clusters = validate_and_split(
-        boundaries, detail["proj_s"],
-        rectified.shape[1], rectified,
-        mzs_thresh=mzs_threshold
-    )
-    print(f"  After MZS split: {len(clusters)} segments")
+        # Step 7b
+        print(f"\n[7b] Filtering weak boundaries ...")
+        boundaries = filter_weak_boundaries(
+            boundaries, detail["proj_s"], _gap_floor)
+        print(f"  After filter ({len(boundaries)-1} cuts): {boundaries}")
 
-    # Step 8b: Post-merge narrow over-splits
-    print("\n[8b] Post-merge: collapsing over-split narrow segments ...")
-    clusters = post_merge_narrow_segments(
-        clusters, rectified, detail["proj_s"]
-    )
-    print(f"  Final segment count: {len(clusters)}")
+        # Step 8
+        print("\n[8] Segment validation and MZS split ...")
+        clusters = validate_and_split(
+            boundaries, detail["proj_s"],
+            rectified.shape[1], rectified,
+            mzs_thresh=mzs_threshold
+        )
+        print(f"  After MZS split: {len(clusters)} segments")
 
-    vis_segmentation(rectified, clusters, len(clusters), conf,
-                     baseline, os.path.join(out_dir, "08_segmentation.png"))
+        # Step 8b
+        print("\n[8b] Post-merge: collapsing over-split narrow segments ...")
+        clusters = post_merge_narrow_segments(
+            clusters, rectified, detail["proj_s"]
+        )
+        print(f"  Final segment count: {len(clusters)}")
 
-    # Step 9
-    print("\n[9] Cropping individual characters ...")
-    chars = crop_characters(rectified, clusters)
-    vis_chars_grid(chars, os.path.join(out_dir, "09_chars_grid.png"))
+        vis_segmentation(rectified, clusters, len(clusters), conf,
+                         baseline, os.path.join(out_dir, "08_segmentation.png"))
 
+        # Step 9
+        print("\n[9] Cropping individual characters ...")
+        chars = crop_characters(rectified, clusters)
+        vis_chars_grid(chars, os.path.join(out_dir, "09_chars_grid.png"))
+
+    # ── Save individual chars ─────────────────────────────────────────────
     if save_individual_chars:
-        for num, crop, _ in chars:
-            cv2.imwrite(os.path.join(chars_dir, f"char_{num:03d}.png"), crop)
+        for num, crop_img, _ in chars:
+            cv2.imwrite(os.path.join(chars_dir, f"char_{num:03d}.png"), crop_img)
         print(f"  Saved {len(chars)} chars -> {chars_dir}/")
 
     vis_pipeline([
         ("Gray",         gray),
         ("Binary",       binary_clean),
-        ("Cropped",      cropped),
-        ("Denoised",     denoised),
-        ("Rectified",    rectified),
+        ("No border",    denoised),
     ], os.path.join(out_dir, "pipeline_summary.png"))
 
     print(f"\n{'─'*64}")
