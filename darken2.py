@@ -340,6 +340,69 @@ def extract_character_band(binary_img, padding: int = 12,
     return masked, baseline, band_half
 
 
+def force_split_massive_segments(clusters, binary_img, proj_s):
+    """
+    Final safety net: if a segment is massively wider than the median width,
+    force-split it STRICTLY by the average character width.
+    This ignores projection valleys entirely for these massive noise blocks
+    and enforces a pure geometric cut.
+    """
+    if len(clusters) < 3:
+        return clusters
+
+    # 1. Calculate a highly robust median width
+    # We strip the top and bottom 10% so tiny specks or giant noise blocks
+    # don't ruin our average width calculation.
+    widths = sorted([c["w"] for c in clusters])
+    trim = max(1, len(widths) // 10)
+    core_widths = widths[trim:-trim] if len(widths) > 4 else widths
+    median_w = float(np.median(core_widths))
+
+    new_clusters = []
+    changed = False
+
+    for c in clusters:
+        x0 = c["x"]
+        x1 = c["x"] + c["w"]
+        w = c["w"]
+
+        # If a box is >= 1.7x the median width, it's definitely multiple characters glued together.
+        if w >= median_w * 1.7:
+            # Calculate exactly how many characters should fit in this space
+            expected_chars = max(2, int(round(w / median_w)))
+            print(
+                f"    Strict Split: Box at x={x0} is {w}px wide (median {median_w:.0f}px). Slicing evenly into {expected_chars}.")
+
+            # Pure mathematical cuts based strictly on the average width
+            chunk_width = w / expected_chars
+            cuts = [int(x0 + i * chunk_width) for i in range(1, expected_chars)]
+
+            boundaries = [x0] + cuts + [x1]
+            for i in range(len(boundaries) - 1):
+                nx0 = boundaries[i]
+                nx1 = boundaries[i + 1]
+
+                # Re-calculate the vertical bounding box (y and h) for this new chunk
+                strip = binary_img[:, nx0:nx1]
+                rows = np.where(np.any(strip == 255, axis=1))[0]
+                if len(rows) > 0:
+                    new_clusters.append({
+                        "label": 0,  # Will re-label at end
+                        "x": nx0, "y": int(rows[0]),
+                        "w": nx1 - nx0, "h": int(rows[-1]) - int(rows[0]),
+                        "area": int(np.sum(strip == 255))
+                    })
+            changed = True
+        else:
+            new_clusters.append(c)
+
+    # Re-apply sequential labels (1, 2, 3...) if we sliced anything
+    if changed:
+        for i, c in enumerate(new_clusters):
+            c["label"] = i + 1
+        return new_clusters
+
+    return clusters
 
 
 def _cca_filter(img, threshold, kill_color, replace_color):
@@ -1731,6 +1794,9 @@ def segment_one_row(binary_row, row_y_offset, gap_floor_ratio,
     clusters = post_merge_narrow_segments(
         clusters, rectified, detail["proj_s"])
 
+    # ADD THIS LINE HERE:
+    clusters = force_split_massive_segments(clusters, rectified, detail["proj_s"])
+
     # Crop characters for this row
     chars = crop_characters(rectified, clusters)
 
@@ -2150,6 +2216,11 @@ def run_module1(image_path: str,
             clusters, rectified, detail["proj_s"]
         )
         print(f"  Final segment count: {len(clusters)}")
+
+        # ADD THIS BLOCK HERE (Step 8c):
+        print("\n[8c] Force-splitting massive merged segments ...")
+        clusters = force_split_massive_segments(clusters, rectified, detail["proj_s"])
+        print(f"  Count after force-split: {len(clusters)}")
 
         vis_segmentation(rectified, clusters, len(clusters), conf,
                          baseline, os.path.join(out_dir, "08_segmentation.png"))
