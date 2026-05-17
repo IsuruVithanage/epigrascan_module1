@@ -32,7 +32,7 @@ epigrascan/
 │
 ├── src/                                # 🚀 Active Production Codebase
 │   ├── 01_segmentation/                # Image Cleaning & Cropping
-│   │   ├── darken2.py                  # Main segmentation entry point
+│   │   ├── segmenter_core.py           # Main segmentation entry point
 │   │   └── modules/                    # Specialized OpenCV R&D modules
 │   │       ├── baseline.py
 │   │       ├── calibration.py
@@ -69,7 +69,7 @@ epigrascan/
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/YourUsername/epigrascan.git
+   git clone https://github.com/username/epigrascan.git
    cd epigrascan
    ```
 
@@ -87,7 +87,7 @@ epigrascan/
 
 4. **Verify PyTorch/CUDA Setup:**
    ```bash
-   python src/02_classification/utils/test_setup.py
+   python src/s2_classification/utils/test_setup.py
    ```
 
 ---
@@ -99,25 +99,25 @@ All configurations (dataset paths, model hyperparameters, training settings) are
 ### 1. Segmentation
 Run the segmentation pipeline to clean and extract character crops from raw estampages.
 ```bash
-python src/01_segmentation/darken2.py
+python src/s1_segmentation/segmenter_core.py
 ```
 
 ### 2. Training the Classifier
 Train the MobileNetV2 model using the curriculum learning schedule defined in `config.yaml`.
 ```bash
-python src/02_classification/train_classifier.py
+python src/s2_classification/train_classifier.py
 ```
 
 ### 3. Inference
 Run the inference pipeline to classify previously segmented characters.
 ```bash
-python src/02_classification/inference.py
+python src/s2_classification/inference.py
 ```
 
 ### 4. Restoration
 Validate outputs and reconstruct the document space.
 ```bash
-python src/03_restoration/check_json.py
+python src/s3_restoration/check_json.py
 ```
 
 ---

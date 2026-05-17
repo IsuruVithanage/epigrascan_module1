@@ -6,18 +6,18 @@ from pathlib import Path
 import argparse
 
 # Import the refactored modular pipeline
-from preprocessing_pipeline.preprocessing import preprocess, crop_to_inscription, extract_character_band, noise_removal, remove_border_blobs
-from preprocessing_pipeline.baseline import detect_baseline, rectify
-from preprocessing_pipeline.counting import count_characters
-from preprocessing_pipeline.segmentation import place_boundaries, filter_weak_boundaries, validate_and_split, post_merge_narrow_segments, force_split_massive_segments, crop_characters, detect_text_rows, segment_one_row
-from preprocessing_pipeline.visualization import vis_baseline, vis_count_signals, vis_segmentation, vis_chars_grid, vis_pipeline
-from preprocessing_pipeline.calibration import auto_calibrate
+from src.s1_segmentation.modules.preprocessing import preprocess, crop_to_inscription, extract_character_band, noise_removal, remove_border_blobs
+from src.s1_segmentation.modules.baseline import detect_baseline, rectify
+from src.s1_segmentation.modules.counting import count_characters
+from src.s1_segmentation.modules.segmentation import place_boundaries, filter_weak_boundaries, validate_and_split, post_merge_narrow_segments, force_split_massive_segments, crop_characters, detect_text_rows, segment_one_row
+from src.s1_segmentation.modules.visualization import vis_baseline, vis_count_signals, vis_segmentation, vis_chars_grid, vis_pipeline
+from src.s1_segmentation.modules.calibration import auto_calibrate
 
 # Since we modularized the code, we need to inject GAP_FLOOR_RATIO into the modules
 # that use globals().get("GAP_FLOOR_RATIO") or we can just patch sys.modules.
 # For exact compatibility without changing their logic, we can inject into their namespaces.
-import preprocessing_pipeline.counting as _counting
-import preprocessing_pipeline.segmentation as _segmentation
+import src.s1_segmentation.modules.counting as _counting
+import src.s1_segmentation.modules.segmentation as _segmentation
 
 def run_module1(image_path: str,
                 out_dir: str             = "output_module1",
