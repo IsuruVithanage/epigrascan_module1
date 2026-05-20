@@ -389,7 +389,10 @@ if __name__ == "__main__":
         description="Module 1 - Brahmi Inscription Preprocessing & Segmentation",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("input",
-                    help="Image file, or directory (use --batch)")
+                    nargs="?",
+                    help="Image file, or directory (use --batch)",
+                    default="../../data/raw_estampages/"
+                    )
     ap.add_argument("--out",          default="output_module1")
 
     # ── Preprocessing (new — from reference paper Ch.6) ─────────────────
@@ -430,7 +433,7 @@ if __name__ == "__main__":
                               "RAISE if too many chars, LOWER if too few.")
 
     ap.add_argument("--show",    action="store_true", help="Show matplotlib plots.")
-    ap.add_argument("--batch",   action="store_true", help="Process whole directory.")
+    ap.add_argument("--batch",   action="store_true", help="Process whole directory.", default=True)
     ap.add_argument("--no_auto", action="store_true",
                     help="Disable auto-calibration. Use explicit flags for all params.")
     args = ap.parse_args()
