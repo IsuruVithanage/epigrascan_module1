@@ -393,7 +393,7 @@ if __name__ == "__main__":
                     help="Image file, or directory (use --batch)",
                     default="../../data/raw_estampages/"
                     )
-    ap.add_argument("--out",          default="output_module1")
+    ap.add_argument("--out",          default="batch_results/")
 
     # ── Preprocessing (new — from reference paper Ch.6) ─────────────────
     grp_pre = ap.add_argument_group("Preprocessing (reference paper additions)")
