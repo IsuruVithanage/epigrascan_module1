@@ -6,18 +6,18 @@ from pathlib import Path
 import argparse
 
 # Import the refactored modular pipeline
-from preprocessing_pipeline.preprocessing import preprocess, crop_to_inscription, extract_character_band, noise_removal, remove_border_blobs
-from preprocessing_pipeline.baseline import detect_baseline, rectify
-from preprocessing_pipeline.counting import count_characters
-from preprocessing_pipeline.segmentation import place_boundaries, filter_weak_boundaries, validate_and_split, post_merge_narrow_segments, force_split_massive_segments, crop_characters, detect_text_rows, segment_one_row
-from preprocessing_pipeline.visualization import vis_baseline, vis_count_signals, vis_segmentation, vis_chars_grid, vis_pipeline
-from preprocessing_pipeline.calibration import auto_calibrate
+from src.s1_segmentation.modules.preprocessing import preprocess, crop_to_inscription, extract_character_band, noise_removal, remove_border_blobs
+from src.s1_segmentation.modules.baseline import detect_baseline, rectify
+from src.s1_segmentation.modules.counting import count_characters
+from src.s1_segmentation.modules.segmentation import place_boundaries, filter_weak_boundaries, validate_and_split, post_merge_narrow_segments, force_split_massive_segments, crop_characters, detect_text_rows, segment_one_row
+from src.s1_segmentation.modules.visualization import vis_baseline, vis_count_signals, vis_segmentation, vis_chars_grid, vis_pipeline
+from src.s1_segmentation.modules.calibration import auto_calibrate
 
 # Since we modularized the code, we need to inject GAP_FLOOR_RATIO into the modules
 # that use globals().get("GAP_FLOOR_RATIO") or we can just patch sys.modules.
 # For exact compatibility without changing their logic, we can inject into their namespaces.
-import preprocessing_pipeline.counting as _counting
-import preprocessing_pipeline.segmentation as _segmentation
+import src.s1_segmentation.modules.counting as _counting
+import src.s1_segmentation.modules.segmentation as _segmentation
 
 def run_module1(image_path: str,
                 out_dir: str             = "output_module1",
@@ -389,8 +389,11 @@ if __name__ == "__main__":
         description="Module 1 - Brahmi Inscription Preprocessing & Segmentation",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("input",
-                    help="Image file, or directory (use --batch)")
-    ap.add_argument("--out",          default="output_module1")
+                    nargs="?",
+                    help="Image file, or directory (use --batch)",
+                    default="../../data/raw_estampages/"
+                    )
+    ap.add_argument("--out",          default="batch_results/")
 
     # ── Preprocessing (new — from reference paper Ch.6) ─────────────────
     grp_pre = ap.add_argument_group("Preprocessing (reference paper additions)")
@@ -430,7 +433,7 @@ if __name__ == "__main__":
                               "RAISE if too many chars, LOWER if too few.")
 
     ap.add_argument("--show",    action="store_true", help="Show matplotlib plots.")
-    ap.add_argument("--batch",   action="store_true", help="Process whole directory.")
+    ap.add_argument("--batch",   action="store_true", help="Process whole directory.", default=True)
     ap.add_argument("--no_auto", action="store_true",
                     help="Disable auto-calibration. Use explicit flags for all params.")
     args = ap.parse_args()
