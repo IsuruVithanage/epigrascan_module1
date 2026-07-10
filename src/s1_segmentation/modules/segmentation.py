@@ -770,3 +770,39 @@ def segment_one_row(binary_row, row_y_offset, gap_floor_ratio,
     print(f"  → nlm_h={nlm_h}  noise_thresh={noise_thresh}  "
           f"gap_floor={gap_floor}  otsu_bias={otsu_bias}")
     return params
+
+
+
+def build_clusters_from_boundaries(boundaries, binary_img):
+    """
+    Directly converts 1D boundary cut-lines into 2D cluster dictionaries.
+    Bypasses all dynamic MZS splitting, overlap merging, and sliver checks.
+    """
+    H, W = binary_img.shape[:2]
+    clusters = []
+
+    for i in range(len(boundaries) - 1):
+        x0 = int(boundaries[i])
+        x1 = int(boundaries[i + 1])
+
+        if x1 <= x0:
+            continue
+
+        strip = binary_img[:, x0:x1]
+        rows = np.where(np.any(strip == 255, axis=1))[0]
+
+        if len(rows) == 0:
+            continue
+
+        clusters.append({
+            "label": len(clusters) + 1,
+            "x": x0,
+            "y": int(rows[0]),
+            "w": x1 - x0,
+            "h": int(rows[-1]) - int(rows[0]),
+            "area": int(np.sum(strip == 255))
+        })
+
+    return clusters
+
+
