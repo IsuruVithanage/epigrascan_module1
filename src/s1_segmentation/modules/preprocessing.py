@@ -295,13 +295,23 @@ def extract_character_band(binary_img, padding: int = 12,
 
     return masked, baseline, band_half
 
+
 def _cca_filter(img, threshold, kill_color, replace_color):
     mask = img if kill_color == 255 else cv2.bitwise_not(img)
     n, lbl, st, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     out = img.copy()
+
+    # Dynamic height guard: a stroke should be at least 15% of the crop height to be protected
+    min_char_height = max(15, int(img.shape[0] * 0.15))
+
     for i in range(1, n):
-        if st[i, cv2.CC_STAT_AREA] < threshold:
+        area = st[i, cv2.CC_STAT_AREA]
+        h = st[i, cv2.CC_STAT_HEIGHT]
+
+        # KILL CONDITION: Area is below threshold AND it is too short to be a letter stroke
+        if area < threshold and h < min_char_height:
             out[lbl == i] = replace_color
+
     return out
 
 def noise_removal(cropped, white_thresh=200, black_thresh=200):

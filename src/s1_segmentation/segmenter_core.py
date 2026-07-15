@@ -96,7 +96,7 @@ def run_module1(image_path: str,
     # Step 5: Character band extraction
     print("\n[5] Character band extraction ...")
     denoised, baseline_rough, band_half = extract_character_band(
-        denoised, padding=12, band_height_factor=1.3,
+        denoised, padding=5, band_height_factor=1.1,
         save_vis_path=os.path.join(out_dir, "05_band_vis.png")
     )
     cv2.imwrite(os.path.join(out_dir, "05_band_masked.png"), denoised)
