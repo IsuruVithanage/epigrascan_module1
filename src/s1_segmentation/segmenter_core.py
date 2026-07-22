@@ -18,6 +18,7 @@ from src.s1_segmentation.modules.calibration import auto_calibrate
 # For exact compatibility without changing their logic, we can inject into their namespaces.
 import src.s1_segmentation.modules.counting as _counting
 import src.s1_segmentation.modules.segmentation as _segmentation
+from ultralytics import YOLO
 
 
 def run_module1(image_path: str,
@@ -35,6 +36,12 @@ def run_module1(image_path: str,
                 save_individual_chars: bool = True,
                 show_plots: bool = False) -> dict:
     # [Auto-calibration logic remains unchanged...]
+
+    # --- LOAD YOLO MODEL ---
+    print("\n[0] Loading YOLO Segmenter...")
+    yolo_model = YOLO('models/best.pt')
+
+
     if auto_params:
         print(f"\n[AUTO] Calibrating parameters for: {image_path}")
         cal = auto_calibrate(image_path)
@@ -119,84 +126,79 @@ def run_module1(image_path: str,
         rectified, col_offsets = rectify(denoised, baseline)
         cv2.imwrite(os.path.join(out_dir, "08_rectified.png"), rectified)
 
-        # Step 9: Multi-signal character counting
-        print("\n[9] Multi-signal character counting ...")
-        count, conf, detail = count_characters(rectified, baseline)
-        vis_count_signals(detail["proj_s"], detail, count, conf, rectified.shape[1],
-                          os.path.join(out_dir, "09_count_signals.png"))
+        # =====================================================================
+        # NEW STEP 9: YOLO SEGMENTATION ON THE RECTIFIED IMAGE
+        # =====================================================================
+        print("\n[9] Running YOLO Segmentation on Rectified Image...")
 
-        # Step 10: Boundary Placement & Segment Validation
-        print(f"\n[10] Segment validation and splitting ...")
-        boundaries = place_boundaries(detail["proj_s"], count, rectified.shape[1], rectified)
-        boundaries = filter_weak_boundaries(boundaries, detail["proj_s"], _gap_floor)
-        clusters = validate_and_split(boundaries, detail["proj_s"], rectified.shape[1], rectified,
-                                      mzs_thresh=mzs_threshold)
-        clusters = post_merge_narrow_segments(clusters, rectified, detail["proj_s"])
-        clusters = force_split_massive_segments(clusters, rectified, detail["proj_s"])
+        # YOLO requires a 3-channel image, so we convert the binary rectified image
+        rectified_rgb = cv2.cvtColor(rectified, cv2.COLOR_GRAY2RGB)
 
-        vis_segmentation(rectified, clusters, len(clusters), conf, baseline,
-                         os.path.join(out_dir, "10_segmentation.png"))
+        # Run YOLO Inference (using your tweaked thresholds from test.py)
+        results = yolo_model(rectified_rgb, conf=0.25, iou=0.6)
+        raw_boxes = results[0].boxes.xyxy.cpu().numpy()
 
-        # Step 11: Cropping individual characters
-        print("\n[11] Cropping individual characters ...")
-        chars = crop_characters(rectified, clusters)
-        vis_chars_grid(chars, os.path.join(out_dir, "11_chars_grid.png"))
+        clusters = []
+        chars = []
 
-    if save_individual_chars:
-        for num, crop_img, _ in chars:
-            cv2.imwrite(os.path.join(chars_dir, f"char_{num:03d}.png"), crop_img)
+        if len(raw_boxes) == 0:
+            print("  - YOLO found NO characters in this row.")
+        else:
+            processed_boxes = []
+            for box in raw_boxes:
+                x1, y1, x2, y2 = map(int, box)
+                w, h = x2 - x1, y2 - y1
+                cx = x1 + (w / 2)
 
-    vis_pipeline([
-        ("Gray", gray),
-        ("Binary", binary_clean),
-        ("No border", denoised),
-    ], os.path.join(out_dir, "pipeline_summary.png"))
+                # Filter out pure noise (smaller than 8x8)
+                if w > 8 and h > 8:
+                    processed_boxes.append({
+                        'x': x1, 'y': y1, 'w': w, 'h': h, 'cx': cx
+                    })
 
-    # [Return statement remains unchanged...]
+            # Sort boxes strictly left-to-right (since it is already a rectified single row)
+            processed_boxes.sort(key=lambda b: b['cx'])
 
-    print(f"\n{'─'*64}")
-    print(f"  CHARACTER COUNT  : {len(clusters)}")
-    print(f"  Estimator votes  : proj={detail['proj']}  "
-          f"cca={detail['cca']}  gaps={detail['gaps']}")
-    print(f"  Confidence       : {conf.upper()}")
-    print(f"  Flow type        : {baseline['flow_type'].upper()}")
-    print(f"  Curvature        : {baseline['curvature']:.1f} px")
-    print(f"  Tilt angle       : {baseline['angle_deg']:.1f} deg")
-    print(f"  Gap floor used   : {_gap_floor*100:.0f}% of max projection "
-          f"({'auto' if auto_params else 'manual'})")
-    print(f"  NLM h used       : {_nlm_h}  "
-          f"noise_thresh={_white_thresh}/{_black_thresh}")
-    print(f"{'─'*64}")
-    print(f"  Preprocessing quality (ref paper metrics):")
-    print(f"    PSNR            : {metrics['psnr']} dB")
-    print(f"    SSIM            : {metrics['ssim']}")
-    print(f"    Laplacian var   : {metrics['laplacian_var']:.0f}")
-    print(f"    Edge retention  : {metrics['edge_retention']*100:.1f}%")
-    print(f"{'─'*64}")
-    print(f"  TIP: auto_params=True (default) → parameters auto-tuned per image")
-    print(f"  TIP: override any param via CLI flags, e.g. --gap_floor 0.55")
-    print(f"  TIP: use --no_auto to disable auto-calibration (full manual)")
-    print(f"  Output dir       : {out_dir}")
-    print(f"{'─'*64}\n")
+            # Step 10: Crop and Save YOLO Characters
+            print(f"\n[10] Cropping {len(processed_boxes)} characters...")
+
+            for i, b in enumerate(processed_boxes):
+                # Ensure coordinates are within image bounds
+                y_start = max(0, b['y'] - 2)
+                y_end = min(rectified.shape[0], b['y'] + b['h'] + 2)
+                x_start = max(0, b['x'] - 2)
+                x_end = min(rectified.shape[1], b['x'] + b['w'] + 2)
+
+                crop_img = rectified[y_start:y_end, x_start:x_end]
+
+                if crop_img.size > 0:
+                    b['label'] = i + 1
+                    clusters.append(b)
+                    chars.append((i + 1, crop_img, b))
+
+                    if save_individual_chars:
+                        cv2.imwrite(os.path.join(chars_dir, f"yolo_char_{i + 1:03d}.png"), crop_img)
+
+        # Optional: Draw YOLO bounding boxes on the rectified image for debugging
+        vis_yolo = rectified_rgb.copy()
+        for c in clusters:
+            cv2.rectangle(vis_yolo, (c['x'], c['y']), (c['x'] + c['w'], c['y'] + c['h']), (0, 255, 0), 2)
+            cv2.putText(vis_yolo, str(c['label']), (c['x'], max(c['y'] - 4, 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        cv2.imwrite(os.path.join(out_dir, "09_yolo_segmentation.png"), vis_yolo)
+
+        # Return updated dictionary
+    print(f"\n{' ' * 64}")
+    print(f"  YOLO CHARACTER COUNT : {len(clusters)}")
+    print(f"  Output dir           : {out_dir}")
+    print(f"{' ' * 64}\n")
 
     return {
-        "chars":             chars,
-        "count":             len(clusters),
-        "confidence":        conf,
-        "flow_type":         baseline["flow_type"],
-        "baseline_info":     baseline,
-        "clusters":          clusters,
-        "proj_detail":       detail,
-        "quality_metrics":   metrics,
-        "params_used":       {
-            "nlm_h":              _nlm_h,
-            "bilateral":          _bilateral,
-            "otsu_bias":          _otsu_bias,
-            "white_noise_thresh": _white_thresh,
-            "black_noise_thresh": _black_thresh,
-            "gap_floor_ratio":    _gap_floor,
-            "auto_params":        auto_params,
-        },
+        "chars": chars,
+        "count": len(clusters),
+        "flow_type": baseline["flow_type"] if 'baseline' in locals() else "unknown",
+        "clusters": clusters,
+        "quality_metrics": metrics
     }
 
 def batch_process(input_dir, out_root="batch_output", **kwargs):

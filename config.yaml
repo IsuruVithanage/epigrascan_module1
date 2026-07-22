@@ -14,6 +14,6 @@ model:
 
 training:
   batch_size: 32           # Increase this if your GPU can handle it (e.g., 32 or 64) for faster, smoother training
-  epochs: 25               # Give it enough time to master the dataset
+  epochs: 10               # Give it enough time to master the dataset
   learning_rate: 0.001
   curriculum_start_epoch: 8 # Introduce the heavy rock damage at epoch 8
